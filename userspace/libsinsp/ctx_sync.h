@@ -57,6 +57,10 @@ public:
 		uint64_t timeout_ns = 3'000'000;
 		// Safety margin subtracted from the clock when a buffer is idle.
 		uint64_t margin_ns = 1'000'000;
+		// After a timeout on a buffer, do not wait for it again for this long: a quiet worker that
+		// sleeps in the engine does not publish anything, and every clone/evaluation that depends
+		// on it would stall for the whole timeout.
+		uint64_t backoff_ns = 50'000'000;
 		bool enabled = true;
 	};
 
@@ -64,6 +68,7 @@ public:
 		uint64_t waits;     // waits that were not satisfied by the first check
 		uint64_t timeouts;  // waits that gave up
 		uint64_t wait_ns;   // total time spent in the waits that were not immediate
+		uint64_t skipped;   // waits not even started because of the backoff after a timeout
 	};
 
 	using clock_fn = std::function<uint64_t()>;
@@ -131,6 +136,8 @@ private:
 
 	struct alignas(64) slot {
 		std::atomic<uint64_t> wm{0};
+		// steady-clock time (ns) before which waits on this buffer are skipped
+		std::atomic<uint64_t> skip_until{0};
 	};
 
 	config m_cfg;
@@ -139,5 +146,6 @@ private:
 	std::unique_ptr<slot[]> m_slots;
 	std::atomic<uint64_t> m_waits{0};
 	std::atomic<uint64_t> m_timeouts{0};
+	std::atomic<uint64_t> m_skipped{0};
 	std::atomic<uint64_t> m_wait_ns{0};
 };

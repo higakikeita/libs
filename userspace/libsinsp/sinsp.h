@@ -242,6 +242,13 @@ public:
 	sinsp_ctx_sync& get_ctx_sync() const { return *m_ctx_sync; }
 
 	/*!
+	  \brief Multi-worker mode, to be called before reading the ancestors of the thread of an event
+	  (proc.pname, proc.aname[N]...): waits (bounded, see sinsp_ctx_sync) until the buffers of the
+	  first `depth` ancestors have processed everything up to `ts`. No-op in single-thread mode.
+	*/
+	void wait_for_ancestors(const sinsp_threadinfo& tinfo, uint64_t ts, uint32_t depth);
+
+	/*!
 	  \brief Get the maximum number of bytes currently in use by any CPU buffer
 	 */
 	uint64_t max_buf_used() const;

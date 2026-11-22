@@ -1072,6 +1072,35 @@ uint8_t* sinsp_filter_check_thread::extract_single(sinsp_evt* evt, uint32_t* len
 		return NULL;
 	}
 
+	// Multi-worker mode: the ancestors belong to other buffers, wait (bounded) until they have
+	// processed everything that happened before this event. One check of two fields otherwise.
+	if(tinfo != NULL && m_inspector->get_ctx_sync().enabled()) {
+		switch(m_field_id) {
+		case TYPE_PPID:
+		case TYPE_PNAME:
+		case TYPE_PEXE:
+		case TYPE_PEXEPATH:
+		case TYPE_PCMDLINE:
+			m_inspector->wait_for_ancestors(*tinfo, evt->get_ts(), 1);
+			break;
+		case TYPE_APID:
+		case TYPE_ANAME:
+		case TYPE_AEXE:
+		case TYPE_AEXEPATH:
+		case TYPE_AARGS:
+		case TYPE_ACMDLINE:
+		case TYPE_AENV:
+			// `m_argid` is the ancestor level when given; otherwise the whole chain is read, of
+			// which only the closest ancestors are synchronized.
+			m_inspector->wait_for_ancestors(*tinfo,
+			                                evt->get_ts(),
+			                                m_argid > 0 ? static_cast<uint32_t>(m_argid) : 3);
+			break;
+		default:
+			break;
+		}
+	}
+
 	switch(m_field_id) {
 	case TYPE_TID:
 		m_val.s64 = evt->get_tid();

@@ -1640,6 +1640,28 @@ int32_t sinsp::next(sinsp_evt** puevt, const sinsp_buffer_t buffer_h) {
 	return res;
 }
 
+void sinsp::wait_for_ancestors(const sinsp_threadinfo& tinfo, uint64_t ts, uint32_t depth) {
+	if(!m_ctx_sync->enabled()) {
+		return;
+	}
+	const uint16_t own = sinsp_ctx_sync::buffer_index_for_tgid(tinfo.get_pid(), m_ctx_sync->n_buffers());
+	int64_t ptid = tinfo.get_ptid();
+	for(uint32_t level = 0; level < depth && ptid > 0; level++) {
+		// If the ancestor is not in the table yet, assume it is the leader of its group.
+		const auto ancestor = m_thread_manager->find_thread(ptid, true);
+		const int64_t tgid = ancestor != nullptr ? ancestor->get_pid() : ptid;
+		m_ctx_sync->wait_for(own,
+		                     sinsp_ctx_sync::buffer_index_for_tgid(tgid, m_ctx_sync->n_buffers()),
+		                     ts);
+		// The ancestor may have just been created by the buffer we waited for.
+		const auto synced = ancestor != nullptr ? ancestor : m_thread_manager->find_thread(ptid, true);
+		if(synced == nullptr) {
+			break;
+		}
+		ptid = synced->get_ptid();
+	}
+}
+
 uint16_t sinsp::get_num_allocated_buffer_handles() const {
 	return m_buffers.size() - 1;
 }

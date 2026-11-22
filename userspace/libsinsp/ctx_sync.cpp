@@ -33,6 +33,12 @@ void sinsp_ctx_sync::init(uint16_t n_buffers) {
 bool sinsp_ctx_sync::wait_slow(uint16_t target, uint64_t ts) {
 	using clk = std::chrono::steady_clock;
 	const auto start = clk::now();
+	const uint64_t start_ns =
+	        std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
+	if(start_ns < m_slots[target].skip_until.load(std::memory_order_relaxed)) {
+		m_skipped.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
 	const auto deadline = start + std::chrono::nanoseconds(m_cfg.timeout_ns);
 	const auto& wm = m_slots[target].wm;
 	bool ok = false;
@@ -64,6 +70,8 @@ bool sinsp_ctx_sync::wait_slow(uint16_t target, uint64_t ts) {
 	        std::memory_order_relaxed);
 	if(!ok) {
 		m_timeouts.fetch_add(1, std::memory_order_relaxed);
+		m_slots[target].skip_until.store(start_ns + m_cfg.timeout_ns + m_cfg.backoff_ns,
+		                                 std::memory_order_relaxed);
 	}
 	return ok;
 }
@@ -71,11 +79,13 @@ bool sinsp_ctx_sync::wait_slow(uint16_t target, uint64_t ts) {
 sinsp_ctx_sync::stats sinsp_ctx_sync::get_stats() const {
 	return {m_waits.load(std::memory_order_relaxed),
 	        m_timeouts.load(std::memory_order_relaxed),
-	        m_wait_ns.load(std::memory_order_relaxed)};
+	        m_wait_ns.load(std::memory_order_relaxed),
+	        m_skipped.load(std::memory_order_relaxed)};
 }
 
 void sinsp_ctx_sync::reset_stats() {
 	m_waits = 0;
 	m_timeouts = 0;
 	m_wait_ns = 0;
+	m_skipped = 0;
 }

@@ -192,6 +192,31 @@ TEST_P(multi_buffer_sync_repeat, ancestor_name_is_up_to_date_when_the_parent_wor
 	EXPECT_EQ(m_inspector.get_ctx_sync().get_stats().timeouts, 0u);
 }
 
+// The grandchild is created BEFORE the parent runs the new program, and then does something. The
+// clone exit of the grandchild is not enough: the rule evaluation of the event of the grandchild
+// reads the parent, so it must wait for the partition of the parent (proc.pname, evaluation time).
+TEST_P(multi_buffer_sync_repeat, ancestor_name_read_at_evaluation_waits_for_the_parent_worker) {
+	child_is_created(CHILD_TID, PARENT_TID);
+	child_is_created(GRANDCHILD_TID, CHILD_TID);
+	emit_in_buffer_of(CHILD_TID);
+	generate_execve_exit_event_with_default_params(CHILD_TID, "/tmp/evil", "evil");
+	emit_in_buffer_of(GRANDCHILD_TID);
+	generate_random_event(GRANDCHILD_TID);
+
+	std::string pname;
+	std::vector<int> delay(2, 0);
+	delay[buffer_for_tgid(CHILD_TID)] = 5;
+	run_workers(delay, {}, [&](uint16_t buffer, sinsp_evt* evt, size_t index) {
+		// The second event of the buffer of the grandchild: the clone exit is the first.
+		if(buffer == buffer_for_tgid(GRANDCHILD_TID) && index == 1) {
+			pname = get_field_as_string(evt, "proc.pname");
+		}
+	});
+
+	EXPECT_EQ(pname, "evil");
+	EXPECT_EQ(m_inspector.get_ctx_sync().get_stats().timeouts, 0u);
+}
+
 INSTANTIATE_TEST_SUITE_P(repeat, multi_buffer_sync_repeat, ::testing::Range(0, REPETITIONS));
 
 // --- controls and limits ------------------------------------------------------------------------
@@ -313,4 +338,83 @@ TEST_F(single_thread_sync, no_waiting_in_single_thread_mode) {
 	EXPECT_EQ(stats.waits, 0u);
 	EXPECT_EQ(stats.timeouts, 0u);
 	EXPECT_NE(m_inspector.m_thread_manager->find_thread(CHILD_TID, true), nullptr);
+}
+
+// --- micro benchmarks (disabled: run with --gtest_also_run_disabled_tests --gtest_filter=*bench*) --
+//
+// Synthetic numbers, not real traffic. They only print; nothing is asserted about time.
+
+namespace {
+double now_ns() {
+	return std::chrono::duration<double, std::nano>(
+	               std::chrono::steady_clock::now().time_since_epoch())
+	        .count();
+}
+}  // namespace
+
+// Cost of the clone exit path when the parent's worker is already ahead (the common case): the
+// same events are processed with the synchronization on and off. Single thread, so this measures
+// the pure overhead of the check (a single acquire load), plus the clone exit itself.
+TEST_F(multi_buffer_sync, DISABLED_bench_clone_exit_parent_ahead) {
+	constexpr int ROUNDS = 5;
+	constexpr int CLONES = 4000;
+	// The parent's partition has published a watermark beyond everything.
+	m_inspector.get_ctx_sync().publish_idle(buffer_for_tgid(PARENT_TID), UINT64_C(4000000000000000000));
+	int64_t next_tid = 1000;  // even: the buffer of the child is not the one of the init thread
+	double ns_on = 0, ns_off = 0;
+	for(int round = 0; round < ROUNDS * 2; round++) {
+		const bool on = (round % 2) == 0;
+		auto cfg = m_inspector.get_ctx_sync().get_config();
+		cfg.enabled = on;
+		m_inspector.get_ctx_sync().set_config(cfg);
+		for(int i = 0; i < CLONES; i++, next_tid += 2) {
+			child_is_created(next_tid, PARENT_TID);
+		}
+		route_to_buffer(-1);
+		const uint16_t b = buffer_for_tgid(1000);
+		const double t0 = now_ns();
+		for(int i = 0; i < CLONES; i++) {
+			ASSERT_NE(next_event_from_buffer(b), nullptr);
+		}
+		(on ? ns_on : ns_off) += now_ns() - t0;
+	}
+	const double n = static_cast<double>(ROUNDS) * CLONES;
+	printf("BENCH clone exit, parent ahead: sync on %.1f ns/clone, sync off %.1f ns/clone, "
+	       "delta %.1f ns (waits=%lu)\n",
+	       ns_on / n,
+	       ns_off / n,
+	       (ns_on - ns_off) / n,
+	       static_cast<unsigned long>(m_inspector.get_ctx_sync().get_stats().waits));
+}
+
+// Latency added when the parent's partition is behind: a thread waits for a watermark that another
+// thread publishes after `lag_us`. Reported: the time the waiter spent minus the lag.
+TEST_F(multi_buffer_sync, DISABLED_bench_wait_latency_parent_behind) {
+	auto& sync = m_inspector.get_ctx_sync();
+	for(const int lag_us : {0, 20, 100, 1000, 3000}) {
+		constexpr int N = 100;
+		double sum_excess = 0, max_excess = 0;
+		for(int i = 0; i < N; i++) {
+			const uint64_t ts = UINT64_C(1000000000) * (lag_us + 1) + i + 1;
+			std::atomic<double> published_at{0};
+			std::thread publisher([&] {
+				const double start = now_ns();
+				while(now_ns() - start < lag_us * 1000.0) {
+				}
+				published_at = now_ns();
+				sync.publish_event(1, ts);
+			});
+			sync.wait_for(0, 1, ts);
+			const double done = now_ns();
+			publisher.join();
+			const double excess = done - published_at.load();
+			sum_excess += excess;
+			max_excess = std::max(max_excess, excess);
+		}
+		printf("BENCH wait latency, parent behind by %d us: wake-up delay after the publish "
+		       "avg %.1f us, max %.1f us\n",
+		       lag_us,
+		       sum_excess / N / 1000.0,
+		       max_excess / 1000.0);
+	}
 }
