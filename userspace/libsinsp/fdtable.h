@@ -18,6 +18,7 @@ limitations under the License.
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <tuple>
 #include <type_traits>
@@ -284,8 +285,17 @@ private:
 	mutable bool m_entries_maybe_shared{false};
 
 #ifdef LIBSINSP_USE_FOLLY
+	// The cache is keyed by a per-instance id and not by the address of the table: the address of a
+	// destroyed table can be reused by a new one, and the cache of another thread would then
+	// return an entry of the old table.
+	static uint64_t next_cache_id() {
+		static std::atomic<uint64_t> s_next{1};
+		return s_next.fetch_add(1, std::memory_order_relaxed);
+	}
+	const uint64_t m_cache_id{next_cache_id()};
+
 	struct fd_cache_entry {
-		const sinsp_fdtable_impl* table{nullptr};
+		uint64_t table_id{0};
 		int64_t fd{-1};
 		std::shared_ptr<fdinfo_t> fdinfo;
 	};
@@ -297,7 +307,7 @@ private:
 
 	inline void invalidate_tl_cache() const {
 		auto& c = tl_cache();
-		if(c.table == this) {
+		if(c.table_id == m_cache_id) {
 			c.fd = -1;
 			c.fdinfo.reset();
 		}

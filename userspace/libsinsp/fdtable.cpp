@@ -53,7 +53,7 @@ sinsp_fdtable_impl<SyncPolicy>::find_ref(int64_t fd) const {
 	if constexpr(traits::k_use_folly_chm) {
 #ifdef LIBSINSP_USE_FOLLY
 		auto& c = tl_cache();
-		if(c.table == this && c.fd == fd) {
+		if(c.table_id == m_cache_id && c.fd == fd) {
 			if(m_params && m_params->m_sinsp_stats_v2) {
 				m_params->m_sinsp_stats_v2->get_thread_counters().inc_n_cached_fd_lookups();
 			}
@@ -75,7 +75,7 @@ sinsp_fdtable_impl<SyncPolicy>::find_ref(int64_t fd) const {
 		// Lazily resolve the device number of file entries coming from a proc scan.
 		lookup_device(*fdit->second);
 
-		c.table = this;
+		c.table_id = m_cache_id;
 		c.fd = fd;
 		c.fdinfo = fdit->second;
 		return c.fdinfo;
