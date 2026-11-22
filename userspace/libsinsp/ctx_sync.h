@@ -79,7 +79,9 @@ public:
 
 	// The state a child inherits, captured by the parent's worker. Opaque for this class.
 	using payload_t = std::unique_ptr<void, void (*)(void*)>;
-	static payload_t no_payload() { return payload_t(nullptr, [](void*) {}); }
+	static payload_t no_payload() {
+		return payload_t(nullptr, [](void*) {});
+	}
 
 	struct stats {
 		uint64_t waits;     // waits that were not satisfied by the first check

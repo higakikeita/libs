@@ -224,11 +224,7 @@ TEST_F(multi_buffer_order, a_thread_clone_shares_the_fd_table_and_takes_no_snaps
 	constexpr int64_t THREAD_TID = 102;
 	parent_clone_returns(THREAD_TID, PARENT_TID, PPM_CL_CLONE_THREAD | PPM_CL_CLONE_FILES);
 	emit_in_buffer_of(PARENT_TID);  // a thread belongs to the buffer of its process
-	generate_clone_x_event(0,
-	                       THREAD_TID,
-	                       PARENT_TID,
-	                       0,
-	                       PPM_CL_CLONE_THREAD | PPM_CL_CLONE_FILES);
+	generate_clone_x_event(0, THREAD_TID, PARENT_TID, 0, PPM_CL_CLONE_THREAD | PPM_CL_CLONE_FILES);
 	thread_opens_a_file(PARENT_TID, PARENT_FD);
 
 	process_next_in_buffer_of(PARENT_TID);
@@ -282,8 +278,8 @@ TEST_F(multi_buffer_order, a_snapshot_of_another_parent_is_not_used_when_the_tid
 	child_is_created(OTHER_PARENT, PARENT_TID);
 	process_next_in_buffer_of(OTHER_PARENT);
 
-	thread_opens_a_file(PARENT_TID, PARENT_FD);       // only the init thread has this fd
-	parent_clone_returns(CHILD_TID, PARENT_TID);      // snapshot of the init thread: never consumed
+	thread_opens_a_file(PARENT_TID, PARENT_FD);   // only the init thread has this fd
+	parent_clone_returns(CHILD_TID, PARENT_TID);  // snapshot of the init thread: never consumed
 	thread_opens_a_file(OTHER_PARENT, PARENT_FD + 5);  // only the other parent has this fd
 	parent_clone_returns(CHILD_TID, OTHER_PARENT);     // the tid is reused by another parent
 	child_is_created(CHILD_TID, OTHER_PARENT);

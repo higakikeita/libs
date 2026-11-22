@@ -88,10 +88,10 @@ protected:
 	// Per-event callback of the workers: (buffer index, event, index of the event in the buffer).
 	using on_event_fn = std::function<void(uint16_t, sinsp_evt*, size_t)>;
 
-	// One thread per buffer consumes the whole buffer with sinsp::next(). `start_delay_ms[i]` delays
-	// the first call of the worker of buffer i, `never_start[i]` keeps it from running at all. When
-	// a worker has consumed its events it keeps polling the (empty) buffer, like a real worker,
-	// until every other worker is done, so that the idle watermark is published.
+	// One thread per buffer consumes the whole buffer with sinsp::next(). `start_delay_ms[i]`
+	// delays the first call of the worker of buffer i, `never_start[i]` keeps it from running at
+	// all. When a worker has consumed its events it keeps polling the (empty) buffer, like a real
+	// worker, until every other worker is done, so that the idle watermark is published.
 	void run_workers(const std::vector<int>& start_delay_ms,
 	                 const std::vector<bool>& never_start = {},
 	                 const on_event_fn& on_event = nullptr) {
@@ -138,15 +138,16 @@ protected:
 	}
 };
 
-class multi_buffer_sync_repeat : public multi_buffer_sync, public ::testing::WithParamInterface<int> {
-};
+class multi_buffer_sync_repeat : public multi_buffer_sync,
+                                 public ::testing::WithParamInterface<int> {};
 }  // namespace
 
 // --- the three scenarios of multi_buffer_order.ut.cpp, with real workers -------------------------
 
 // The parent opened the file before the clone but its worker is late: the child's worker waits for
 // it, and the child inherits the fd.
-TEST_P(multi_buffer_sync_repeat, fd_opened_before_clone_is_inherited_when_the_parent_worker_is_late) {
+TEST_P(multi_buffer_sync_repeat,
+       fd_opened_before_clone_is_inherited_when_the_parent_worker_is_late) {
 	ASSERT_NE(buffer_for_tgid(PARENT_TID), buffer_for_tgid(CHILD_TID));
 	thread_opens_a_file(PARENT_TID, PARENT_FD);
 	child_is_created(CHILD_TID, PARENT_TID);
@@ -322,7 +323,8 @@ TEST_F(multi_buffer_sync, no_wait_when_the_parent_worker_is_ahead) {
 	route_to_buffer(-1);
 
 	// Make the parent's partition publish a watermark that is beyond the clone.
-	m_inspector.get_ctx_sync().publish_idle(buffer_for_tgid(PARENT_TID), UINT64_C(4000000000000000000));
+	m_inspector.get_ctx_sync().publish_idle(buffer_for_tgid(PARENT_TID),
+	                                        UINT64_C(4000000000000000000));
 	ASSERT_NE(next_event_from_buffer(buffer_for_tgid(CHILD_TID)), nullptr);
 
 	const auto stats = m_inspector.get_ctx_sync().get_stats();
@@ -417,7 +419,8 @@ TEST_F(single_thread_sync, no_snapshot_in_single_thread_mode) {
 	          0u);
 }
 
-// --- micro benchmarks (disabled: run with --gtest_also_run_disabled_tests --gtest_filter=*bench*) --
+// --- micro benchmarks (disabled: run with --gtest_also_run_disabled_tests --gtest_filter=*bench*)
+// --
 //
 // Synthetic numbers, not real traffic. They only print; nothing is asserted about time.
 
@@ -436,7 +439,8 @@ TEST_F(multi_buffer_sync, DISABLED_bench_clone_exit_parent_ahead) {
 	constexpr int ROUNDS = 5;
 	constexpr int CLONES = 4000;
 	// The parent's partition has published a watermark beyond everything.
-	m_inspector.get_ctx_sync().publish_idle(buffer_for_tgid(PARENT_TID), UINT64_C(4000000000000000000));
+	m_inspector.get_ctx_sync().publish_idle(buffer_for_tgid(PARENT_TID),
+	                                        UINT64_C(4000000000000000000));
 	int64_t next_tid = 1000;  // even: the buffer of the child is not the one of the init thread
 	double ns_on = 0, ns_off = 0;
 	for(int round = 0; round < ROUNDS * 2; round++) {
