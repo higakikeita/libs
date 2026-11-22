@@ -192,6 +192,16 @@ public:
 	*/
 	virtual void open_raw_block(uint8_t** buffer_ptr, uint64_t* buffer_size_ptr);
 
+	/*!
+	  \brief Like open_test_input(), but also provides per-buffer event queues. The inspector
+	  reserves one buffer handle per queue, as it does with the per-CPU ring buffers of the live
+	  engines, so that the events of each queue can be consumed with `next(evt, buffer_h)`.
+	  `buffers` can be nullptr, which is the same as the overload above.
+	*/
+	void open_test_input(scap_test_input_data* data,
+	                     scap_test_input_buffers* buffers,
+	                     sinsp_mode_t mode = SINSP_MODE_TEST);
+
 	void fseek(uint64_t filepos) { scap_fseek(m_h, filepos); }
 
 	/*!

@@ -143,6 +143,25 @@ protected:
 
 	void open_inspector(sinsp_mode_t mode = SINSP_MODE_TEST);
 
+	// Multi-buffer mode: opens the inspector with `n_buffers` independent event queues, mimicking
+	// the per-CPU ring buffers consumed by one worker each. There is no ordering between the
+	// buffers: the test decides which buffer's event is processed next, so a test can reproduce
+	// any interleaving, including the ones that the timestamp merge of the single stream mode
+	// never produces. Events are added with `add_event_to_buffer()` and consumed with
+	// `next_event_from_buffer()`. Must be called before adding events to any buffer.
+	void open_inspector_multi_buffer(uint16_t n_buffers, sinsp_mode_t mode = SINSP_MODE_TEST);
+
+	// Adds an event to the given buffer (0-based). Timestamps must not decrease within a buffer.
+	scap_evt* _add_event_to_buffer(uint16_t buffer_idx,
+	                               uint64_t ts,
+	                               uint64_t tid,
+	                               ppm_event_code event_type,
+	                               uint32_t n,
+	                               ...);
+
+	// Processes the next event of the given buffer. Returns nullptr if the buffer is empty.
+	sinsp_evt* next_event_from_buffer(uint16_t buffer_idx);
+
 	template<class... Ts>
 	void _check_event_params(const char* filename,
 	                         int lineno,
@@ -247,6 +266,10 @@ protected:
 
 #define add_event_advance_ts(ts, tid, code, n, ...)         \
 	_add_event_advance_ts(ts, tid, code, n, ##__VA_ARGS__); \
+	_check_event_params(__FILE__, __LINE__, code, n, ##__VA_ARGS__)
+
+#define add_event_to_buffer(buffer_idx, ts, tid, code, n, ...)         \
+	_add_event_to_buffer(buffer_idx, ts, tid, code, n, ##__VA_ARGS__); \
 	_check_event_params(__FILE__, __LINE__, code, n, ##__VA_ARGS__)
 
 #define add_filtered_event_advance_ts(ts, tid, code, n, ...)         \
@@ -473,6 +496,13 @@ protected:
 
 	scap_test_input_data m_test_data;
 	std::vector<scap_evt*> m_events;
+
+	// Multi-buffer mode (see open_inspector_multi_buffer()). The events are owned by
+	// m_buffer_events; the engine consumes them through the m_test_buffers entries.
+	scap_test_input_buffers m_test_buffers_desc{};
+	std::vector<scap_test_input_buffer> m_test_buffers;
+	std::vector<std::vector<scap_evt*>> m_buffer_events;
+	std::vector<uint64_t> m_buffer_last_ts;
 	std::vector<scap_evt*> m_async_events;
 
 	std::vector<scap_threadinfo> m_threads;

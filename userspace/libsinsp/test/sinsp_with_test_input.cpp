@@ -36,11 +36,71 @@ sinsp_with_test_input::~sinsp_with_test_input() {
 		free(el);
 	}
 
+	for(auto& buffer_events : m_buffer_events) {
+		for(auto& el : buffer_events) {
+			free(el);
+		}
+	}
+
 	libsinsp_logger()->reset();
 }
 
 void sinsp_with_test_input::open_inspector(sinsp_mode_t mode) {
 	m_inspector.open_test_input(&m_test_data, mode);
+}
+
+void sinsp_with_test_input::open_inspector_multi_buffer(uint16_t n_buffers, sinsp_mode_t mode) {
+	m_test_buffers.assign(n_buffers, scap_test_input_buffer{nullptr, 0});
+	m_buffer_events.assign(n_buffers, {});
+	m_buffer_last_ts.assign(n_buffers, 0);
+	m_test_buffers_desc.buffers = m_test_buffers.data();
+	m_test_buffers_desc.n_buffers = n_buffers;
+	m_inspector.open_test_input(&m_test_data, &m_test_buffers_desc, mode);
+}
+
+scap_evt* sinsp_with_test_input::_add_event_to_buffer(uint16_t buffer_idx,
+                                                      uint64_t ts,
+                                                      uint64_t tid,
+                                                      ppm_event_code event_type,
+                                                      uint32_t n,
+                                                      ...) {
+	if(buffer_idx >= m_buffer_events.size()) {
+		throw std::runtime_error("buffer " + std::to_string(buffer_idx) +
+		                         " does not exist: call open_inspector_multi_buffer() first");
+	}
+	if(ts < m_buffer_last_ts[buffer_idx]) {
+		throw std::runtime_error("events of the same buffer cannot have decreasing timestamps");
+	}
+
+	va_list args;
+	va_start(args, n);
+	scap_evt* event = create_event_v(ts, tid, event_type, nullptr, n, args);
+	va_end(args);
+	if(event == nullptr) {
+		throw std::runtime_error("cannot create event type: " + std::to_string(event_type));
+	}
+
+	auto& events = m_buffer_events[buffer_idx];
+	auto& buffer = m_test_buffers[buffer_idx];
+	// The engine advances `buffer.events` while consuming, so the consumed prefix is the
+	// difference between what we stored and what is left.
+	const size_t consumed = events.size() - buffer.event_count;
+	events.push_back(event);
+	buffer.events = events.data() + consumed;
+	buffer.event_count = events.size() - consumed;
+	m_buffer_last_ts[buffer_idx] = ts;
+	return event;
+}
+
+sinsp_evt* sinsp_with_test_input::next_event_from_buffer(uint16_t buffer_idx) {
+	// The sinsp buffer 0 is the default one, the ones of the engine start from 1.
+	const auto buffer_h = static_cast<sinsp_buffer_t>(buffer_idx + 1);
+	sinsp_evt* evt = nullptr;
+	int32_t result;
+	// Skip all filtered-out events.
+	while((result = m_inspector.next(&evt, buffer_h)) == SCAP_FILTERED_EVENT) {
+	}
+	return result == SCAP_SUCCESS ? evt : nullptr;
 }
 
 sinsp_evt* sinsp_with_test_input::advance_ts_get_event(uint64_t ts) {
