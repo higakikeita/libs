@@ -42,26 +42,30 @@ bool sinsp_ctx_sync::wait_slow(uint16_t target, uint64_t ts) {
 	const auto deadline = start + std::chrono::nanoseconds(m_cfg.timeout_ns);
 	const auto& wm = m_slots[target].wm;
 	bool ok = false;
-	// Spin, then yield, then sleep for short times: the common wait is a few microseconds.
-	for(uint32_t i = 0;; i++) {
+	// Spin for a few microseconds, then yield the CPU for up to 2 ms (a plain sleep wakes up about
+	// a millisecond late on a typical kernel, which would dominate the wait), then sleep.
+	constexpr auto spin_phase = std::chrono::microseconds(20);
+	constexpr auto yield_phase = std::chrono::milliseconds(2);
+	for(;;) {
 		if(wm.load(std::memory_order_acquire) >= ts) {
 			ok = true;
 			break;
 		}
-		if(i < 200) {
+		const auto now = clk::now();
+		if(now >= deadline) {
+			break;
+		}
+		const auto elapsed = now - start;
+		if(elapsed < spin_phase) {
 #if defined(__x86_64__) || defined(__i386__)
 			__builtin_ia32_pause();
 #elif defined(__aarch64__)
 			__asm__ __volatile__("yield");
 #endif
-		} else if(i < 400) {
+		} else if(elapsed < yield_phase) {
 			std::this_thread::yield();
 		} else {
-			std::this_thread::sleep_for(std::chrono::microseconds(50));
-		}
-		if((i >= 200 || (i & 0x1f) == 0) && clk::now() >= deadline) {
-			ok = wm.load(std::memory_order_acquire) >= ts;
-			break;
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
 		}
 	}
 	m_waits.fetch_add(1, std::memory_order_relaxed);
