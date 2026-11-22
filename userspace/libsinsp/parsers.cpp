@@ -43,9 +43,11 @@ limitations under the License.
 #include <libsinsp/packed_data.h>
 
 sinsp_parser::sinsp_parser(const std::shared_ptr<sinsp_parser_shared_params> &shared_params,
-                           sinsp_evt &tmp_evt_storage):
+                           sinsp_evt &tmp_evt_storage,
+                           const uint16_t buffer_idx):
         m_params{shared_params},
-        m_tmp_evt_storage{tmp_evt_storage} {}
+        m_tmp_evt_storage{tmp_evt_storage},
+        m_buffer_idx{buffer_idx} {}
 
 sinsp_parser::~sinsp_parser() {}
 
@@ -1043,6 +1045,22 @@ void sinsp_parser::parse_clone_exit_caller(sinsp_evt &evt,
 	/*=============================== ADD THREAD TO THE TABLE ===========================*/
 }
 
+void sinsp_parser::wait_for_parent_partition(const sinsp_evt &evt, const int64_t ptid) const {
+	const auto *sync = m_params->m_ctx_sync.get();
+	if(!m_params->m_multi_thread_mode || sync == nullptr || !sync->enabled()) {
+		return;
+	}
+	// If the parent is not in the table there is nothing we can copy, and no way to know the
+	// buffer it lives in: do not wait.
+	const auto parent = m_params->m_thread_manager->find_thread(ptid, true);
+	if(parent == nullptr) {
+		return;
+	}
+	const uint16_t target =
+	        sinsp_ctx_sync::buffer_index_for_tgid(parent->get_pid(), sync->n_buffers());
+	m_params->m_ctx_sync->wait_for(m_buffer_idx, target, evt.get_ts());
+}
+
 void sinsp_parser::parse_clone_exit_child(sinsp_evt &evt, sinsp_parser_verdict &verdict) const {
 	int64_t child_tid = evt.get_tid();
 
@@ -1144,6 +1162,12 @@ void sinsp_parser::parse_clone_exit_child(sinsp_evt &evt, sinsp_parser_verdict &
 	if(is_thread_leader) {
 		/* We need to copy data from the parent */
 		lookup_tid = child_tinfo->get_ptid();
+
+		/* In multi-worker mode the parent belongs to another worker, which can be behind or
+		 * ahead of this one: wait (bounded) until it has processed everything that happened
+		 * before this clone, so the state we copy is the one of the clone time.
+		 */
+		wait_for_parent_partition(evt, lookup_tid);
 	} else {
 		/* We need to copy data from the thread leader */
 		lookup_tid = child_tinfo->get_pid();

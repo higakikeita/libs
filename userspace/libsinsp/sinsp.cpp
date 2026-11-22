@@ -259,7 +259,9 @@ sinsp::sinsp(bool with_metrics):
 	                                   m_usergroup_manager,
 	                                   m_sinsp_stats_v2,
 	                                   m_observer,
-	                                   m_platform});
+	                                   m_platform,
+	                                   false,
+	                                   std::make_shared<sinsp_ctx_sync>()});
 
 	// m_next_reservable_buffer_handle is set to 1, as 0 is reserved for the default buffer.
 	m_next_reservable_buffer_handle = static_cast<sinsp_buffer_t>(1);
@@ -525,6 +527,7 @@ void sinsp::open_common(scap_open_args* oargs,
 	}
 
 	m_parser_shared_params->m_multi_thread_mode = n_allocated_scap_buffer_handles > 0;
+	m_parser_shared_params->m_ctx_sync->init(n_allocated_scap_buffer_handles);
 
 	init();
 
@@ -1440,7 +1443,36 @@ int32_t sinsp::next(sinsp_evt** puevt, const sinsp_buffer_t buffer_h) {
 		~tls_lasterr_guard() { scap_clear_thread_lasterr(); }
 	} guard;
 
+	// Context synchronization (multi-worker mode only, see sinsp_ctx_sync): publish the progress of
+	// this buffer so that the workers of the other buffers can wait for it. Nothing happens for
+	// the default buffer and in single-thread mode (the sync object has no buffers).
+	sinsp_ctx_sync* const ctx_sync = m_parser_shared_params->m_ctx_sync.get();
+	const bool sync_on = !is_default_buffer && ctx_sync->enabled();
+	const uint16_t sync_idx = static_cast<uint16_t>(buffer_h - 1);
+	// The clock is sampled BEFORE looking at the buffer, and only while it was found empty by the
+	// previous call: an empty buffer will not later receive an event older than this time.
+	const uint64_t idle_t0 = (sync_on && buffer.m_idle) ? ctx_sync->now() : 0;
+
 	int32_t res = fetch_next_event(evt, buffer);
+
+	if(sync_on) {
+		if(res == SCAP_SUCCESS) {
+			buffer.m_idle = false;
+			// Events coming from the async queue carry a global timestamp, not one of this buffer.
+			if(evt != buffer.m_async_evt.get()) {
+				// Release: everything this worker did for the previous events is visible to
+				// whoever observes this watermark. Published before parsing the event.
+				ctx_sync->publish_event(sync_idx, evt->get_ts());
+			}
+		} else if(res == SCAP_TIMEOUT) {
+			buffer.m_idle = true;
+			if(idle_t0 != 0) {
+				ctx_sync->publish_idle(sync_idx, idle_t0);
+			}
+		} else if(res == SCAP_EOF) {
+			ctx_sync->publish_eof(sync_idx);
+		}
+	}
 
 	if(res == SCAP_SUCCESS) {
 		res = m_suppress.process_event(evt->get_scap_evt());

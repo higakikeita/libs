@@ -28,6 +28,7 @@ limitations under the License.
 #include <libsinsp/user.h>
 #include <libsinsp/threadinfo.h>
 #include <libsinsp/sinsp_parser_verdict.h>
+#include <libsinsp/ctx_sync.h>
 #include <memory>
 #include <unordered_map>
 
@@ -62,6 +63,9 @@ public:
 	sinsp_observer* const& m_observer;
 	scap_platform* const& m_scap_platform;
 	bool m_multi_thread_mode = false;
+	// Cross-partition synchronization of the multi-worker mode. Always set by sinsp; it only has
+	// an effect when m_multi_thread_mode is true.
+	std::shared_ptr<sinsp_ctx_sync> m_ctx_sync;
 };
 
 struct per_tid_lastevent {
@@ -107,8 +111,11 @@ struct per_tid_lastevent {
 
 class sinsp_parser {
 public:
+	// `buffer_idx` is the 0-based index of the (non-default) buffer this parser belongs to, used to
+	// never wait on the own buffer.
 	sinsp_parser(const std::shared_ptr<sinsp_parser_shared_params>& shared_params,
-	             sinsp_evt& tmp_evt_storage);
+	             sinsp_evt& tmp_evt_storage,
+	             uint16_t buffer_idx = sinsp_ctx_sync::INVALID_BUFFER);
 	~sinsp_parser();
 
 	//
@@ -138,6 +145,13 @@ private:
 	//
 	inline void store_event(sinsp_evt& evt) const;
 	inline void set_event_source(sinsp_evt& evt) const;
+
+	// Multi-worker mode: waits until the worker that owns the thread group of `ptid` has processed
+	// everything that happened before `evt`, so that the state read from the parent is up to date.
+	// Bounded; on timeout the caller proceeds with the possibly stale state (the timeout is counted
+	// by sinsp_ctx_sync). No-op in single-thread mode, if the parent is unknown or if it lives in
+	// the buffer of this parser.
+	void wait_for_parent_partition(const sinsp_evt& evt, int64_t ptid) const;
 
 	//
 	// Parsers
@@ -322,6 +336,7 @@ private:
 
 	const std::shared_ptr<sinsp_parser_shared_params> m_params;
 	sinsp_evt& m_tmp_evt_storage;
+	const uint16_t m_buffer_idx;
 	mutable std::unordered_map<int64_t, per_tid_lastevent> m_lastevent_by_tid;
 
 	bool m_track_connection_status = false;

@@ -126,6 +126,10 @@ class sinsp_buffer {
 	uint64_t m_last_procrequest_tod;
 
 	// Per-buffer event count and first-event timestamp (avoids contended atomics).
+	// Only touched by the worker of this buffer: true if the previous sinsp::next() on this buffer
+	// found it empty. Used to sample the clock for the idle watermark only while idle.
+	bool m_idle{false};
+
 	uint64_t m_nevts{0};
 	uint64_t m_firstevent_ts{0};
 

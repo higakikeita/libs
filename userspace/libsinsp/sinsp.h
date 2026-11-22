@@ -80,6 +80,7 @@ limitations under the License.
 #include <libsinsp/sinsp_parser_verdict.h>
 #include <libsinsp/timestamper.h>
 #include <libsinsp/sinsp_buffer.h>
+#include <libsinsp/ctx_sync.h>
 
 #include <atomic>
 #include <list>
@@ -233,6 +234,12 @@ public:
 	// TODO: add descriptions
 	uint16_t get_num_allocated_buffer_handles() const;
 	sinsp_buffer_t reserve_buffer_handle();
+
+	/*!
+	  \brief Cross-partition synchronization of the multi-worker mode (see sinsp_ctx_sync): used to
+	  configure the timeouts and to read the counters (waits, timeouts).
+	*/
+	sinsp_ctx_sync& get_ctx_sync() const { return *m_parser_shared_params->m_ctx_sync; }
 
 	/*!
 	  \brief Get the maximum number of bytes currently in use by any CPU buffer

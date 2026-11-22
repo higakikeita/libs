@@ -28,7 +28,12 @@ sinsp_buffer::sinsp_buffer(const sinsp_buffer_t& sinsp_buffer_h,
         m_evt{inspector},
         m_lasterr_buf{},
         m_parser_tmp_evt{inspector},
-        m_parser{std::make_unique<sinsp_parser>(parser_shared_params, m_parser_tmp_evt)},
+        m_parser{std::make_unique<sinsp_parser>(
+                parser_shared_params,
+                m_parser_tmp_evt,
+                sinsp_buffer_h == SINSP_INVALID_BUFFER_HANDLE
+                        ? sinsp_ctx_sync::INVALID_BUFFER
+                        : static_cast<uint16_t>(sinsp_buffer_h - 1))},
         m_parser_verdict{},
         m_async_events_checker{},
         m_async_evt{nullptr},

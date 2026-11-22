@@ -97,6 +97,7 @@ add_library(
 	ifinfo.cpp
 	metrics_collector.cpp
 	logger.cpp
+	ctx_sync.cpp
 	parsers.cpp
 	${LIBS_DIR}/userspace/plugin/plugin_loader.c
 	plugin.cpp
