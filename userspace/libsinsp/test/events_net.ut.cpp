@@ -127,7 +127,7 @@ TEST_F(sinsp_with_test_input, net_ipv4_connect) {
 	        sinsp_test_input::socket_params::default_fd,
 	        scap_const_sized_buffer{server_sockaddr.data(), server_sockaddr.size()});
 
-	sinsp_fdinfo* fdinfo_evt = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo_evt = evt->get_fd_info();
 	ASSERT_NE(fdinfo_evt, nullptr);
 	ASSERT_TRUE(fdinfo_evt->is_ipv4_socket());
 	ASSERT_TRUE(
@@ -311,7 +311,7 @@ TEST_F(sinsp_with_test_input, net_bind_listen_accept_ipv4) {
 	add_default_init_thread();
 	open_inspector();
 	sinsp_evt* evt = NULL;
-	sinsp_fdinfo* fdinfo = NULL;
+	const sinsp_fdinfo* fdinfo = NULL;
 	char ipv4_string[DEFAULT_IP_STRING_SIZE];
 
 	generate_socket_exit_event();
@@ -470,7 +470,7 @@ TEST_F(sinsp_with_test_input, net_connect_exit_event_fails) {
 	add_default_init_thread();
 	open_inspector();
 	sinsp_evt* evt = NULL;
-	sinsp_fdinfo* fdinfo = NULL;
+	const sinsp_fdinfo* fdinfo = NULL;
 
 	generate_socket_exit_event();
 
@@ -658,7 +658,7 @@ TEST_F(sinsp_with_test_input, net_connect_enter_event_is_missing) {
 	add_default_init_thread();
 	open_inspector();
 	sinsp_evt* evt = NULL;
-	sinsp_fdinfo* fdinfo = NULL;
+	const sinsp_fdinfo* fdinfo = NULL;
 	char ipv4_string[DEFAULT_IP_STRING_SIZE];
 
 	generate_socket_exit_event(sinsp_test_input::socket_params(PPM_AF_INET, SOCK_DGRAM));

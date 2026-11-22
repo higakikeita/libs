@@ -63,13 +63,15 @@ struct scap_stats;
  * must be in the range [1; 255].
  * @param allocate_online_only if true, allocate ring buffers taking only into account online CPUs.
  *   This parameter is taken into account only if buffers_num >= 0 && buffers_num <= 1.
+ * @param disable_iterators if true, disable the BPF iterator support (procfs lookups are used).
  * @return `0` on success, `-1` in case of error.
  */
 int pman_init_state(falcosecurity_log_fn log_fn,
                     unsigned long buf_bytes_dim,
                     double buffers_num,
                     int iters_num,
-                    bool allocate_online_only);
+                    bool allocate_online_only,
+                    bool disable_iterators);
 
 /**
  * @brief Return the number of allocated ring buffers.
@@ -338,7 +340,7 @@ int pman_mark_single_64bit_syscall(int syscall_id, bool interesting);
 
 int32_t pman_iter_fetch_task(const struct scap_fetch_callbacks* callbacks,
                              uint32_t tid,
-                             scap_threadinfo** tinfo,
+                             scap_threadinfo* tinfo,
                              char* error);
 int32_t pman_iter_fetch_tasks(const struct scap_fetch_callbacks* callbacks, char* error);
 int32_t pman_iter_fetch_proc_file(const struct scap_fetch_callbacks* callbacks,

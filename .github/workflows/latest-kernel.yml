@@ -18,7 +18,7 @@ jobs:
     steps:
       - name: Checkout Archlinux mainline package ⤵️
         run: |
-          git clone https://aur.archlinux.org/linux-mainline.git linux/
+          git clone --depth=1 https://aur.archlinux.org/linux-mainline.git linux/
 
       - name: Generate driverkit config
         id: latest-version
@@ -35,7 +35,8 @@ jobs:
             krel=$(grep "_tag" PKGBUILD | head -n1 | awk -F"=" '{print $2}')
             echo "kernelrelease: \"${krel:1}\"" >> dk.yaml
             echo "target: vanilla" >> dk.yaml
-            echo "kernelconfigdata: \"$(cat config | base64 | tr -d '\n')\"" >> dk.yaml
+            KERNEL_CONFIG_DATA=$(base64 -w0 config.x86_64)
+            echo "kernelconfigdata: \"$KERNEL_CONFIG_DATA\"" >> dk.yaml
           else
             echo "kernelrelease: \"${{ inputs.linux-version }}\"" >> dk.yaml
             echo "target: arch" >> dk.yaml
@@ -43,7 +44,7 @@ jobs:
           echo "latest_vers=$(grep kernelrelease dk.yaml | awk -F": " '{print $2}')" >> $GITHUB_OUTPUT
 
       - name: Upload driverkit config
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: driverkit_config.yaml
           path: linux/dk.yaml
@@ -55,7 +56,7 @@ jobs:
     runs-on: 'ubuntu-24.04'
     steps:
       - name: Download driverkit config
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: driverkit_config.yaml
 
@@ -83,7 +84,7 @@ jobs:
     runs-on: 'ubuntu-24.04-arm'
     steps:
       - name: Download driverkit config
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: driverkit_config.yaml
 
@@ -110,7 +111,7 @@ jobs:
     needs: [compute-latest-version,build-latest-kernel-amd64,build-latest-kernel-arm64]
     steps:
       - name: Update README badge
-        uses: schneegans/dynamic-badges-action@0e50b8bad39e7e1afd3e4e9c2b7dd145fad07501 # v1.8.0
+        uses: schneegans/dynamic-badges-action@28b0fa8bdeb46170ac397105ece0c1fe58f68910 # v1.9.0
         with:
           auth: ${{ secrets.FEDEDP_GIST_SECRET }}
           gistID: 1cbc5d42edf8e3a02fb75e76625f1072

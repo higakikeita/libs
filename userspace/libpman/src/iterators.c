@@ -83,6 +83,8 @@ static uint32_t get_root_ns_tid(void) {
 	return root_tid;
 }
 
+#ifdef BPF_ITERATOR_SUPPORT
+
 #ifdef BPF_ITERATOR_DEBUG
 
 #if defined(BPF_ITERATOR_DEBUG_RAW) || defined(BPF_ITERATOR_DEBUG_PARSED)
@@ -347,23 +349,31 @@ static void tinfo_from_task_evt(scap_threadinfo *tinfo,
 static void handle_task_evt(const struct ppm_evt_hdr *evt,
                             const scap_const_sized_buffer *evt_params,
                             const struct scap_fetch_callbacks *callbacks,
-                            scap_threadinfo **tinfo_out,
+                            scap_threadinfo *tinfo_storage,
+                            uint64_t *num_tasks_fetched,
                             const scap_sized_buffer *cb_err_buff) {
 	uint32_t pid, tid;
 	get_evt_pid_tid(evt, &pid, &tid);
 
-	scap_threadinfo tinfo = {};
-	tinfo_from_task_evt(&tinfo, pid, tid, evt_params);
+	// Parse into the caller-provided storage when present; use a local storage otherwise.
+	scap_threadinfo local_tinfo;
+	scap_threadinfo *tinfo = tinfo_storage != NULL ? tinfo_storage : &local_tinfo;
+	memset(tinfo, 0, sizeof(*tinfo));
+	tinfo_from_task_evt(tinfo, pid, tid, evt_params);
 
-	DEBUG_PRINT_THREADINFO(&tinfo);
+	DEBUG_PRINT_THREADINFO(tinfo);
 
 	const int32_t res = callbacks->proc_entry_cb(callbacks->ctx,
 	                                             cb_err_buff->buf,
 	                                             (int64_t)tid,
-	                                             &tinfo,
+	                                             tinfo,
 	                                             NULL,
-	                                             tinfo_out);
-	if(scap_unlikely(res != SCAP_SUCCESS)) {
+	                                             NULL);
+	if(scap_likely(res == SCAP_SUCCESS)) {
+		if(num_tasks_fetched) {
+			(*num_tasks_fetched)++;
+		}
+	} else {
 		log_msgf(FALCOSECURITY_LOG_SEV_DEBUG,
 		         "process entry callback failed with error code %d for thread (pid: %u, "
 		         "tid: %u): %.*s",
@@ -590,12 +600,13 @@ static void handle_task_file_evt(const struct ppm_evt_hdr *evt,
 
 	const uint16_t evt_type = evt->type;
 	if(!must_fetch_sockets && is_task_file_socket_evt(evt_type)) {
-		log_msgf(FALCOSECURITY_LOG_SEV_DEBUG,
-		         "received socket event type %d with socket fetching disabled for thread "
-		         "(pid: %u, tid: %u)",
-		         evt_type,
-		         pid,
-		         tid);
+		log_errorf(
+		        "bug: received socket event type %d with socket fetching disabled for thread "
+		        "(pid: %u, tid: %u)",
+		        evt_type,
+		        pid,
+		        tid);
+		return;
 	}
 
 	scap_fdinfo fdinfo = {};
@@ -645,8 +656,11 @@ static void handle_task_file_evt(const struct ppm_evt_hdr *evt,
 	                                             NULL,
 	                                             &fdinfo,
 	                                             NULL);
-
-	if(scap_unlikely(res != SCAP_SUCCESS)) {
+	if(scap_likely(res == SCAP_SUCCESS)) {
+		if(num_files_fetched) {
+			(*num_files_fetched)++;
+		}
+	} else {
 		log_msgf(FALCOSECURITY_LOG_SEV_DEBUG,
 		         "process entry callback failed with error code %d for file (pid: %u, "
 		         "tid: %u, fd: %ld): %.*s",
@@ -656,10 +670,6 @@ static void handle_task_file_evt(const struct ppm_evt_hdr *evt,
 		         fdinfo.fd,
 		         (int)cb_err_buff->size,
 		         (char *)cb_err_buff->buf);
-	}
-
-	if(num_files_fetched) {
-		(*num_files_fetched)++;
 	}
 }
 
@@ -676,9 +686,10 @@ enum evt_handler_selector {
 static int32_t fetch_evts(const int iter_fd,
                           const enum evt_handler_selector selector,
                           const struct scap_fetch_callbacks *callbacks,
-                          scap_threadinfo **tinfo,
-                          const bool must_fetch_sockets,
+                          scap_threadinfo *tinfo,
+                          uint64_t *num_tasks_fetched,
                           uint64_t *num_files_fetched,
+                          const bool must_fetch_sockets,
                           char *error) {
 	// Stack buffer to accommodate at least one event at the time.
 	char buff[MAX_ITER_EVENT_SIZE];
@@ -687,6 +698,10 @@ static int32_t fetch_evts(const int iter_fd,
 	// Buffer used to store any error resulting from callback invocation.
 	char cb_err[256] = {0};
 	const scap_sized_buffer cb_err_buff = {&cb_err, sizeof(cb_err)};
+
+	if(num_tasks_fetched) {
+		*num_tasks_fetched = 0;
+	}
 
 	if(num_files_fetched) {
 		*num_files_fetched = 0;
@@ -737,7 +752,7 @@ static int32_t fetch_evts(const int iter_fd,
 			cb_err[0] = 0;
 			switch(selector) {
 			case EHS_TASK:
-				handle_task_evt(evt, evt_params, callbacks, tinfo, &cb_err_buff);
+				handle_task_evt(evt, evt_params, callbacks, tinfo, num_tasks_fetched, &cb_err_buff);
 				break;
 			case EHS_TASK_FILE:
 				handle_task_file_evt(evt,
@@ -852,10 +867,22 @@ static int32_t fetch(const struct prog_info *prog_info,
                      const struct scap_fetch_callbacks *callbacks,
                      const int pid_filter,
                      const int tid_filter,
-                     scap_threadinfo **tinfo,
-                     const bool must_fetch_sockets,
+                     scap_threadinfo *tinfo,
+                     uint64_t *num_tasks_fetched,
                      uint64_t *num_files_fetched,
+                     const bool must_fetch_sockets,
                      char *error) {
+	if(!g_state.bpf_iter_link_info_supp_info.is_task_filtering_supported &&
+	   (pid_filter != 0 || tid_filter != 0)) {
+		return scap_errprintf(
+		        error,
+		        0,
+		        "bug: wrong configuration: pid_filter (%d) and tid_filter (%d) "
+		        "must both be zero in case in-kernel task filtering support is not available",
+		        pid_filter,
+		        tid_filter);
+	}
+
 	if(pid_filter != 0 && tid_filter != 0) {
 		return scap_errprintf(error,
 		                      0,
@@ -882,14 +909,19 @@ static int32_t fetch(const struct prog_info *prog_info,
 	}
 
 	// Attach the program.
-	LIBBPF_OPTS(bpf_iter_attach_opts, opts);
-	union bpf_iter_link_info linfo;
-	memset(&linfo, 0, sizeof(linfo));
-	linfo.task.pid = pid_filter;  // If the pid is set to zero, no filtering logic is applied.
-	linfo.task.tid = tid_filter;  // If the tid is set to zero, no filtering logic is applied.
-	opts.link_info = &linfo;
-	opts.link_info_len = sizeof(linfo);
-	link = bpf_program__attach_iter(prog_info->prog, &opts);
+	if(g_state.bpf_iter_link_info_supp_info.is_available) {
+		LIBBPF_OPTS(bpf_iter_attach_opts, opts);
+		union bpf_iter_link_info linfo;
+		memset(&linfo, 0, sizeof(linfo));
+		linfo.task.pid = pid_filter;  // If the pid is set to zero, no filtering logic is applied.
+		linfo.task.tid = tid_filter;  // If the tid is set to zero, no filtering logic is applied.
+		opts.link_info = &linfo;
+		opts.link_info_len = sizeof(linfo);
+		link = bpf_program__attach_iter(prog_info->prog, &opts);
+	} else {
+		link = bpf_program__attach_iter(prog_info->prog, NULL);
+	}
+
 	if(!link) {
 		res = scap_errprintf(error, errno, "failed to attach the '%s' program", prog_info->name);
 		goto cleanup;
@@ -909,8 +941,9 @@ static int32_t fetch(const struct prog_info *prog_info,
 	                 prog_info->selector,
 	                 callbacks,
 	                 tinfo,
-	                 must_fetch_sockets,
+	                 num_tasks_fetched,
 	                 num_files_fetched,
+	                 must_fetch_sockets,
 	                 error);
 
 cleanup:
@@ -937,14 +970,19 @@ static void fill_dump_task_file_prog_info(struct prog_info *info) {
 	info->selector = EHS_TASK_FILE;
 }
 
+#endif /* BPF_ITERATOR_SUPPORT */
+
 int32_t pman_iter_fetch_task(const struct scap_fetch_callbacks *callbacks,
                              const uint32_t tid,
-                             scap_threadinfo **tinfo,
+                             scap_threadinfo *tinfo,
                              char *error) {
 #ifndef BPF_ITERATOR_SUPPORT
 	return SCAP_NOT_SUPPORTED;
 #else
-	if(!g_state.is_tasks_dumping_supported) {
+	// Don't use iterators for fetching a single task if the kernel doesn't provide support for
+	// in-kernel task filtering.
+	if(!g_state.is_tasks_dumping_supported ||
+	   !g_state.bpf_iter_link_info_supp_info.is_task_filtering_supported) {
 		return SCAP_NOT_SUPPORTED;
 	}
 
@@ -954,7 +992,10 @@ int32_t pman_iter_fetch_task(const struct scap_fetch_callbacks *callbacks,
 
 	struct prog_info prog_info;
 	fill_dump_task_prog_info(&prog_info);
-	return fetch(&prog_info, callbacks, 0, tid, tinfo, false, NULL, error);
+	uint64_t num_tasks_fetched = 0;
+	const int32_t res =
+	        fetch(&prog_info, callbacks, 0, tid, tinfo, &num_tasks_fetched, NULL, false, error);
+	return res == SCAP_SUCCESS && num_tasks_fetched != 1 ? SCAP_NOTFOUND : res;
 #endif
 }
 
@@ -968,7 +1009,7 @@ int32_t pman_iter_fetch_tasks(const struct scap_fetch_callbacks *callbacks, char
 
 	struct prog_info prog_info;
 	fill_dump_task_prog_info(&prog_info);
-	return fetch(&prog_info, callbacks, 0, 0, NULL, false, NULL, error);
+	return fetch(&prog_info, callbacks, 0, 0, NULL, NULL, NULL, false, error);
 #endif
 }
 
@@ -979,7 +1020,10 @@ int32_t pman_iter_fetch_proc_file(const struct scap_fetch_callbacks *callbacks,
 #ifndef BPF_ITERATOR_SUPPORT
 	return SCAP_NOT_SUPPORTED;
 #else
-	if(!g_state.is_task_files_dumping_supported) {
+	// Don't use iterators for fetching a single process' file if the kernel doesn't provide support
+	// for in-kernel task filtering.
+	if(!g_state.is_task_files_dumping_supported ||
+	   !g_state.bpf_iter_link_info_supp_info.is_task_filtering_supported) {
 		return SCAP_NOT_SUPPORTED;
 	}
 
@@ -993,7 +1037,7 @@ int32_t pman_iter_fetch_proc_file(const struct scap_fetch_callbacks *callbacks,
 
 	struct prog_info prog_info;
 	fill_dump_task_file_prog_info(&prog_info);
-	return fetch(&prog_info, callbacks, pid, 0, NULL, must_fetch_sockets, NULL, error);
+	return fetch(&prog_info, callbacks, pid, 0, NULL, NULL, NULL, must_fetch_sockets, error);
 #endif
 }
 
@@ -1005,7 +1049,10 @@ int32_t pman_iter_fetch_proc_files(const struct scap_fetch_callbacks *callbacks,
 #ifndef BPF_ITERATOR_SUPPORT
 	return SCAP_NOT_SUPPORTED;
 #else
-	if(!g_state.is_task_files_dumping_supported) {
+	// Don't use iterators for fetching a single process' files if the kernel doesn't provide
+	// support for in-kernel task filtering.
+	if(!g_state.is_task_files_dumping_supported ||
+	   !g_state.bpf_iter_link_info_supp_info.is_task_filtering_supported) {
 		return SCAP_NOT_SUPPORTED;
 	}
 
@@ -1018,7 +1065,15 @@ int32_t pman_iter_fetch_proc_files(const struct scap_fetch_callbacks *callbacks,
 
 	struct prog_info prog_info;
 	fill_dump_task_file_prog_info(&prog_info);
-	return fetch(&prog_info, callbacks, pid, 0, NULL, must_fetch_sockets, num_files_fetched, error);
+	return fetch(&prog_info,
+	             callbacks,
+	             pid,
+	             0,
+	             NULL,
+	             NULL,
+	             num_files_fetched,
+	             must_fetch_sockets,
+	             error);
 #endif
 }
 
@@ -1036,6 +1091,6 @@ int32_t pman_iter_fetch_procs_files(const struct scap_fetch_callbacks *callbacks
 
 	struct prog_info prog_info;
 	fill_dump_task_file_prog_info(&prog_info);
-	return fetch(&prog_info, callbacks, 0, 0, NULL, must_fetch_sockets, NULL, error);
+	return fetch(&prog_info, callbacks, 0, 0, NULL, NULL, NULL, must_fetch_sockets, error);
 #endif
 }

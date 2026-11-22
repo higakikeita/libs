@@ -38,9 +38,8 @@ limitations under the License.
 #define ASSERT_FD_GETTERS_NOT_FILE(x)    \
 	ASSERT_EQ(x->get_name(), "");        \
 	ASSERT_EQ(x->get_name_raw(), "");    \
-	ASSERT_EQ(x->get_oldname(), "");     \
 	ASSERT_EQ(x->get_device(), 0);       \
-	ASSERT_EQ(x->tostring_clean(), "");  \
+	ASSERT_EQ(x->tostring(), "");        \
 	ASSERT_EQ(x->get_device_major(), 0); \
 	ASSERT_EQ(x->get_device_minor(), 0); \
 	ASSERT_FALSE(x->is_unix_socket());   \
@@ -73,6 +72,29 @@ TEST_F(sinsp_with_test_input, file_open) {
 	ASSERT_EQ(get_field_as_string(evt, "fd.name"), "/tmp/the_file");
 	ASSERT_EQ(get_field_as_string(evt, "fd.directory"), "/tmp");
 	ASSERT_EQ(get_field_as_string(evt, "fd.filename"), "the_file");
+	// An fd created by the current event is not a name *change*.
+	ASSERT_EQ(get_field_as_string(evt, "fd.name_changed"), "false");
+}
+
+TEST_F(sinsp_with_test_input, file_open_invalid_utf8) {
+	add_default_init_thread();
+
+	open_inspector();
+
+	const auto evt = add_event_advance_ts(increasing_ts(),
+	                                      1,
+	                                      PPME_SYSCALL_OPEN_X,
+	                                      6,
+	                                      (uint64_t)3,
+	                                      "/tmp/bad\xff",
+	                                      (uint32_t)PPM_O_RDWR,
+	                                      (uint32_t)0,
+	                                      (uint32_t)5,
+	                                      (uint64_t)123);
+
+	// Check that invalid UTF-8 bytes in a path reach fd.name and evt.arg.name as they are.
+	ASSERT_EQ(get_field_as_string(evt, "fd.name"), "/tmp/bad\xff");
+	ASSERT_EQ(get_field_as_string(evt, "evt.arg.name"), "/tmp/bad\xff");
 }
 
 TEST_F(sinsp_with_test_input, dup_dup2_dup3) {
@@ -366,7 +388,7 @@ TEST_F(sinsp_with_test_input, umount) {
 	ASSERT_EQ(get_field_as_string(evt, "evt.arg.res"), std::to_string(res));
 	ASSERT_EQ(get_field_as_string(evt, "evt.arg.name"), name);
 
-	sinsp_fdinfo* fdinfo = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 	ASSERT_EQ(fdinfo, nullptr);
 }
 
@@ -385,7 +407,7 @@ TEST_F(sinsp_with_test_input, umount2) {
 	ASSERT_EQ(get_field_as_string(evt, "evt.arg.res"), std::to_string(res));
 	ASSERT_EQ(get_field_as_string(evt, "evt.arg.name"), name);
 
-	sinsp_fdinfo* fdinfo = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 	ASSERT_EQ(fdinfo, nullptr);
 }
 
@@ -416,7 +438,7 @@ TEST_F(sinsp_with_test_input, pipe) {
 	ASSERT_FD_FILTER_CHECK_NOT_FILE()
 
 	/* Here we check the `openflags` field of the fdinfo2, it should be 0 since pipe has no flags */
-	sinsp_fdinfo* fdinfo2 = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo2 = evt->get_fd_info();
 	ASSERT_NE(fdinfo2, nullptr);
 	ASSERT_EQ(fdinfo2->get_openflags(), 0);
 	ASSERT_FD_GETTERS_NOT_FILE(fdinfo2)
@@ -472,7 +494,7 @@ TEST_F(sinsp_with_test_input, pipe2) {
 
 	/* Here we check the `openflags` field of the fdinfo2, it should be 17 since pipe2 has flags
 	 * field */
-	sinsp_fdinfo* fdinfo2 = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo2 = evt->get_fd_info();
 	ASSERT_NE(fdinfo2, nullptr);
 	ASSERT_EQ(fdinfo2->get_openflags(), flags);
 	ASSERT_FD_GETTERS_NOT_FILE(fdinfo2)
@@ -507,7 +529,7 @@ TEST_F(sinsp_with_test_input, inotify_init) {
 	ASSERT_FD_FILTER_CHECK_NOT_FILE()
 
 	/* Here we check fields of the fdinfo directly with getter methods */
-	sinsp_fdinfo* fdinfo = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 	ASSERT_NE(fdinfo, nullptr);
 	ASSERT_STREQ(fdinfo->get_typestring(), "inotify");
 	ASSERT_EQ(fdinfo->get_typechar(), 'i');
@@ -534,7 +556,7 @@ TEST_F(sinsp_with_test_input, inotify_init1) {
 	ASSERT_FD_FILTER_CHECK_NOT_FILE()
 
 	/* Here we check fields of the fdinfo directly with getter methods */
-	sinsp_fdinfo* fdinfo = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 	ASSERT_NE(fdinfo, nullptr);
 	ASSERT_STREQ(fdinfo->get_typestring(), "inotify");
 	ASSERT_EQ(fdinfo->get_typechar(), 'i');
@@ -561,7 +583,7 @@ TEST_F(sinsp_with_test_input, eventfd) {
 	ASSERT_FD_FILTER_CHECK_NOT_FILE()
 
 	/* Here we check fields of the fdinfo directly with getter methods */
-	sinsp_fdinfo* fdinfo = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 	ASSERT_NE(fdinfo, nullptr);
 	ASSERT_STREQ(fdinfo->get_typestring(), "event");
 	ASSERT_EQ(fdinfo->get_typechar(), 'e');
@@ -589,7 +611,7 @@ TEST_F(sinsp_with_test_input, eventfd2) {
 	ASSERT_FD_FILTER_CHECK_NOT_FILE()
 
 	/* Here we check fields of the fdinfo directly with getter methods */
-	sinsp_fdinfo* fdinfo = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 	ASSERT_NE(fdinfo, nullptr);
 	ASSERT_STREQ(fdinfo->get_typestring(), "event");
 	ASSERT_EQ(fdinfo->get_typechar(), 'e');
@@ -624,7 +646,7 @@ TEST_F(sinsp_with_test_input, signalfd) {
 	ASSERT_FD_FILTER_CHECK_NOT_FILE()
 
 	/* Here we check fields of the fdinfo directly with getter methods */
-	sinsp_fdinfo* fdinfo = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 	ASSERT_NE(fdinfo, nullptr);
 	ASSERT_STREQ(fdinfo->get_typestring(), "signalfd");
 	ASSERT_EQ(fdinfo->get_typechar(), 's');
@@ -659,7 +681,7 @@ TEST_F(sinsp_with_test_input, signalfd4) {
 	ASSERT_FD_FILTER_CHECK_NOT_FILE()
 
 	/* Here we check fields of the fdinfo directly with getter methods */
-	sinsp_fdinfo* fdinfo = evt->get_fd_info();
+	const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 	ASSERT_NE(fdinfo, nullptr);
 	ASSERT_STREQ(fdinfo->get_typestring(), "signalfd");
 	ASSERT_EQ(fdinfo->get_typechar(), 's');
@@ -832,4 +854,207 @@ TEST_F(sinsp_with_test_input, test_pidfd) {
 	ASSERT_EQ(get_field_as_string(evt, "fd.filename"), "the_file");
 	ASSERT_EQ(get_field_as_string(evt, "fd.typechar"), "f");
 	ASSERT_EQ(get_field_as_string(evt, "fd.type"), "file");
+}
+
+// `evt.abspath` resolves the path against the event's dirfd. That lookup must not
+// disturb the event's own fd: on openat the event's fdinfo is the newly opened file,
+// so an extraction that installed the dirfd there left every field extracted
+// afterwards describing the directory instead of the file.
+TEST_F(sinsp_with_test_input, abspath_extraction_leaves_event_fd_alone) {
+	add_default_init_thread();
+	open_inspector();
+
+	constexpr int64_t dirfd = 5;
+	constexpr int64_t fd = 6;
+	const std::string dir_name = "/tmp/dir";
+	const std::string file_name = dir_name + "/file.txt";
+
+	// A directory fd for the relative path to resolve against.
+	add_event_advance_ts(increasing_ts(),
+	                     1,
+	                     PPME_SYSCALL_OPENAT2_X,
+	                     8,
+	                     dirfd,
+	                     (int64_t)PPM_AT_FDCWD,
+	                     dir_name.c_str(),
+	                     (uint32_t)(PPM_O_RDONLY | PPM_O_DIRECTORY),
+	                     (uint32_t)0,
+	                     (uint32_t)0,
+	                     (uint32_t)0,
+	                     (uint64_t)0);
+
+	// openat(dirfd, "file.txt"): the event's fd is the file it just created.
+	auto evt = add_event_advance_ts(increasing_ts(),
+	                                1,
+	                                PPME_SYSCALL_OPENAT_2_X,
+	                                7,
+	                                fd,
+	                                dirfd,
+	                                "file.txt",
+	                                (uint32_t)PPM_O_RDWR,
+	                                (uint32_t)0,
+	                                (uint32_t)0,
+	                                (uint64_t)0);
+	ASSERT_EQ(get_field_as_string(evt, "fd.name"), file_name);
+
+	// abspath resolves the relative name through the dirfd...
+	ASSERT_EQ(get_field_as_string(evt, "evt.abspath"), file_name);
+
+	// ...and the fields extracted after it still describe the file, not the directory.
+	ASSERT_EQ(get_field_as_string(evt, "fd.name"), file_name);
+	ASSERT_EQ(get_field_as_string(evt, "fs.path.name"), file_name);
+
+	// For the `*at` events that carry the dirfd in their fd parameter, the event's fd
+	// *is* the directory (see get_exit_event_fd_location()); abspath leaves it that way.
+	evt = add_event_advance_ts(increasing_ts(),
+	                           1,
+	                           PPME_SYSCALL_UNLINKAT_2_X,
+	                           4,
+	                           (int64_t)0,
+	                           dirfd,
+	                           "file.txt",
+	                           (uint32_t)0);
+	ASSERT_EQ(get_field_as_string(evt, "evt.abspath"), file_name);
+	ASSERT_EQ(get_field_as_string(evt, "fd.name"), dir_name);
+	ASSERT_EQ(get_field_as_string(evt, "fs.path.name"), file_name);
+}
+
+// A dirfd that is already the root directory must not yield a doubled separator.
+// The trailing-slash check used to index the string terminator, so a '/' was
+// appended unconditionally and abspath reported "//etc/passwd" for this case;
+// concatenate_paths() keeps the leading "//" rather than collapsing it.
+TEST_F(sinsp_with_test_input, abspath_root_dirfd_single_separator) {
+	add_default_init_thread();
+	open_inspector();
+
+	constexpr int64_t dirfd = 5;
+	constexpr int64_t fd = 6;
+
+	// A directory fd for "/".
+	add_event_advance_ts(increasing_ts(),
+	                     1,
+	                     PPME_SYSCALL_OPENAT2_X,
+	                     8,
+	                     dirfd,
+	                     (int64_t)PPM_AT_FDCWD,
+	                     "/",
+	                     (uint32_t)(PPM_O_RDONLY | PPM_O_DIRECTORY),
+	                     (uint32_t)0,
+	                     (uint32_t)0,
+	                     (uint32_t)0,
+	                     (uint64_t)0);
+
+	auto evt = add_event_advance_ts(increasing_ts(),
+	                                1,
+	                                PPME_SYSCALL_OPENAT_2_X,
+	                                7,
+	                                fd,
+	                                dirfd,
+	                                "etc/passwd",
+	                                (uint32_t)PPM_O_RDONLY,
+	                                (uint32_t)0,
+	                                (uint32_t)0,
+	                                (uint64_t)0);
+	ASSERT_EQ(get_field_as_string(evt, "evt.abspath"), "/etc/passwd");
+
+	// unlinkat carries the dirfd in its fd parameter; same requirement.
+	evt = add_event_advance_ts(increasing_ts(),
+	                           1,
+	                           PPME_SYSCALL_UNLINKAT_2_X,
+	                           4,
+	                           (int64_t)0,
+	                           dirfd,
+	                           "etc/passwd",
+	                           (uint32_t)0);
+	ASSERT_EQ(get_field_as_string(evt, "evt.abspath"), "/etc/passwd");
+}
+
+// Characterization test for how evt.abspath resolves its dirfd, pinning the cases
+// where extract_abspath() and sinsp_parser::parse_dirfd() -- which computes the same
+// thing for the parser and the fspath check -- must agree, so that replacing the
+// former's open-coded copy with a call to the latter is provably behavior-preserving.
+//
+// Mind the separator when reading the unknown-dirfd expectations below.
+// concatenate_paths() does not insert one -- it copies the second path at the end of
+// the first verbatim -- so the prefix has to carry it. parse_dirfd() omits it for its
+// "<UNKNOWN>" answer, which is why fd.name and fs.path.name, which take that route
+// directly, report "<UNKNOWN>etc/passwd", while evt.abspath adds the separator and
+// reports "<UNKNOWN>/etc/passwd".
+TEST_F(sinsp_with_test_input, abspath_dirfd_resolution_cases) {
+	add_default_init_thread();
+	open_inspector();
+
+	constexpr int64_t unknown_dirfd = 99;
+	constexpr int64_t file_dirfd = 7;
+	int64_t fd = 10;
+
+	// An absolute path wins over the dirfd, which is not even looked up.
+	auto evt = add_event_advance_ts(increasing_ts(),
+	                                1,
+	                                PPME_SYSCALL_OPENAT_2_X,
+	                                7,
+	                                fd++,
+	                                unknown_dirfd,
+	                                "/etc/passwd",
+	                                (uint32_t)PPM_O_RDONLY,
+	                                (uint32_t)0,
+	                                (uint32_t)0,
+	                                (uint64_t)0);
+	ASSERT_EQ(get_field_as_string(evt, "evt.abspath"), "/etc/passwd");
+
+	// AT_FDCWD resolves against the thread's cwd.
+	evt = add_event_advance_ts(increasing_ts(),
+	                           1,
+	                           PPME_SYSCALL_OPENAT_2_X,
+	                           7,
+	                           fd++,
+	                           (int64_t)PPM_AT_FDCWD,
+	                           "etc/passwd",
+	                           (uint32_t)PPM_O_RDONLY,
+	                           (uint32_t)0,
+	                           (uint32_t)0,
+	                           (uint64_t)0);
+	ASSERT_EQ(get_field_as_string(evt, "evt.abspath"), "/root/etc/passwd");
+
+	// A dirfd that is a plain file, not a directory: neither resolver checks, both
+	// concatenate against its name.
+	add_event_advance_ts(increasing_ts(),
+	                     1,
+	                     PPME_SYSCALL_OPEN_X,
+	                     6,
+	                     file_dirfd,
+	                     "/tmp/afile",
+	                     (uint32_t)PPM_O_RDONLY,
+	                     (uint32_t)0,
+	                     (uint32_t)0,
+	                     (uint64_t)0);
+	evt = add_event_advance_ts(increasing_ts(),
+	                           1,
+	                           PPME_SYSCALL_OPENAT_2_X,
+	                           7,
+	                           fd++,
+	                           file_dirfd,
+	                           "etc/passwd",
+	                           (uint32_t)PPM_O_RDONLY,
+	                           (uint32_t)0,
+	                           (uint32_t)0,
+	                           (uint64_t)0);
+	ASSERT_EQ(get_field_as_string(evt, "evt.abspath"), "/tmp/afile/etc/passwd");
+
+	// An unknown dirfd, as reported by the fields that already go through
+	// parse_dirfd()/format_dirfd(): no separator is inserted after "<UNKNOWN>".
+	evt = add_event_advance_ts(increasing_ts(),
+	                           1,
+	                           PPME_SYSCALL_OPENAT_2_X,
+	                           7,
+	                           fd++,
+	                           unknown_dirfd,
+	                           "etc/passwd",
+	                           (uint32_t)PPM_O_RDONLY,
+	                           (uint32_t)0,
+	                           (uint32_t)0,
+	                           (uint64_t)0);
+	ASSERT_EQ(get_field_as_string(evt, "fd.name"), "<UNKNOWN>etc/passwd");
+	ASSERT_EQ(get_field_as_string(evt, "fs.path.name"), "<UNKNOWN>etc/passwd");
+	ASSERT_EQ(get_field_as_string(evt, "evt.abspath"), "<UNKNOWN>/etc/passwd");
 }

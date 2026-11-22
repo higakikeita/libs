@@ -23,6 +23,7 @@ limitations under the License.
 #include <libsinsp/sinsp_int.h>
 #include <libsinsp/plugin.h>
 #include <libsinsp/plugin_manager.h>
+#include <libsinsp/parsers.h>
 #include <libsinsp/value_parser.h>
 
 using namespace std;
@@ -653,9 +654,7 @@ uint8_t* sinsp_filter_check_event::extract_argraw(sinsp_evt* evt,
 	return const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(data));
 }
 
-uint8_t* sinsp_filter_check_event::extract_abspath(sinsp_evt* evt,
-                                                   uint32_t* len,
-                                                   const bool sanitize_strings) {
+uint8_t* sinsp_filter_check_event::extract_abspath(sinsp_evt* evt, uint32_t* len) {
 	std::string spath;
 
 	if(evt->get_tinfo() == nullptr) {
@@ -695,7 +694,7 @@ uint8_t* sinsp_filter_check_event::extract_abspath(sinsp_evt* evt,
 			//
 			m_strstorage = sinsp_utils::concatenate_paths("", evt->get_param(3)->as<std::string>());
 
-			return extract_single_string(m_strstorage, len, sanitize_strings);
+			return extract_single_string(m_strstorage, len);
 		}
 	} else if(etype == PPME_SYSCALL_LINKAT_2_X) {
 		if(m_argid == 0 || m_argid == 1) {
@@ -749,37 +748,18 @@ uint8_t* sinsp_filter_check_event::extract_abspath(sinsp_evt* evt,
 	const auto dirfd = dirfd_param->as<int64_t>();
 	const auto path = path_param->as<std::string_view>();
 
-	string sdir;
-
-	bool is_absolute = (path[0] == '/');
-	if(is_absolute) {
-		//
-		// The path is absolute.
-		// Some processes (e.g. irqbalance) actually do this: they pass an invalid fd and
-		// and absolute path, and openat succeeds.
-		//
-		sdir = ".";
-	} else if(dirfd == PPM_AT_FDCWD) {
-		sdir = evt->get_tinfo()->get_cwd();
-	} else {
-		evt->set_fd_info(evt->get_tinfo()->get_fd(dirfd));
-
-		if(evt->get_fd_info() == nullptr) {
-			ASSERT(false);
-			sdir = "<UNKNOWN>/";
-		} else {
-			auto fd_name = evt->get_fd_info()->get_name();
-			if(!fd_name.empty() && fd_name.back() == '/') {
-				sdir = fd_name;
-			} else {
-				sdir = fd_name + '/';
-			}
-		}
+	// The same dirfd resolution the parser and the fspath check use. Its result is a
+	// prefix for concatenate_paths(), which inserts no separator of its own, so make
+	// sure it ends with one: parse_dirfd() omits it for its "<UNKNOWN>" answer, and
+	// every other answer already carries it.
+	std::string sdir = sinsp_parser::parse_dirfd(*evt, path, dirfd);
+	if(!sdir.empty() && sdir.back() != '/') {
+		sdir += '/';
 	}
 
 	m_strstorage = sinsp_utils::concatenate_paths(sdir, path);
 
-	return extract_single_string(m_strstorage, len, sanitize_strings);
+	return extract_single_string(m_strstorage, len);
 }
 
 inline uint8_t* sinsp_filter_check_event::extract_buflen(sinsp_evt* evt, uint32_t* len) {
@@ -834,9 +814,7 @@ uint8_t* sinsp_filter_check_event::extract_error_count(sinsp_evt* evt, uint32_t*
 	return extract_single_val(m_val.u32, len);
 }
 
-uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
-                                                  uint32_t* len,
-                                                  bool sanitize_strings) {
+uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt, uint32_t* len) {
 	*len = 0;
 	switch(m_field_id) {
 	case TYPE_LATENCY:
@@ -853,7 +831,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 		// Hardcoded value to "0ns" for now to avoid breaking changes.
 		// TODO(irozzo): get rid of this once the deprecated fields are removed.
 		m_strstorage = "0ns";
-		return extract_single_string(m_strstorage, len, sanitize_strings);
+		return extract_single_string(m_strstorage, len);
 	}
 	case TYPE_DELTA:
 	case TYPE_DELTA_S:
@@ -883,13 +861,13 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 		switch(m_inspector->get_time_output_mode()) {
 		case 'h':
 			sinsp_utils::ts_to_string(evt->get_ts(), &m_strstorage, false, true);
-			return extract_single_string(m_strstorage, len, sanitize_strings);
+			return extract_single_string(m_strstorage, len);
 
 		case 'a':
 			m_strstorage += to_string(evt->get_ts() / ONE_SECOND_IN_NS);
 			m_strstorage += ".";
 			m_strstorage += to_string(evt->get_ts() % ONE_SECOND_IN_NS);
-			return extract_single_string(m_strstorage, len, sanitize_strings);
+			return extract_single_string(m_strstorage, len);
 
 		case 'r': {
 			const uint64_t first_ts = m_inspector->get_firstevent_ts();
@@ -900,12 +878,12 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 			         "%09llu",
 			         (evt->get_ts() - first_ts) % ONE_SECOND_IN_NS);
 			m_strstorage += string(timebuffer);
-			return extract_single_string(m_strstorage, len, sanitize_strings);
+			return extract_single_string(m_strstorage, len);
 		}
 
 		case 'd': {
 			m_strstorage = "0.000000000";
-			return extract_single_string(m_strstorage, len, sanitize_strings);
+			return extract_single_string(m_strstorage, len);
 		}
 
 		case 'D':
@@ -926,13 +904,11 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 			m_tsdelta = (tts - m_val.u64) % ONE_SECOND_IN_NS;
 
 			m_val.u64 = tts;
-			return extract_single_string(m_strstorage, len, sanitize_strings);
+			return extract_single_string(m_strstorage, len);
 		}
 	}
 	case TYPE_DIR:
-		return extract_single_cstring(PPME_IS_ENTER(evt->get_type()) ? ">" : "<",
-		                              len,
-		                              sanitize_strings);
+		return extract_single_cstring(PPME_IS_ENTER(evt->get_type()) ? ">" : "<", len);
 	case TYPE_TYPE: {
 		// TODO(ekoops): from each case, remove the following const_casts once the method signature
 		//   is updated to return a pointer to a const buffer.
@@ -967,7 +943,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 		}
 		}
 
-		return extract_single_cstring(evt_name, len, sanitize_strings);
+		return extract_single_cstring(evt_name, len);
 	} break;
 	case TYPE_TYPE_IS: {
 		uint16_t etype = evt->get_scap_evt()->type;
@@ -1008,7 +984,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 			evt_name = const_cast<char*>(evt->get_name());
 		}
 
-		return extract_single_cstring(evt_name, len, sanitize_strings);
+		return extract_single_cstring(evt_name, len);
 	} break;
 	case TYPE_CATEGORY:
 		sinsp_evt::category cat;
@@ -1104,7 +1080,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 			break;
 		}
 
-		return extract_single_string(m_strstorage, len, sanitize_strings);
+		return extract_single_string(m_strstorage, len);
 	case TYPE_CPU:
 		m_val.u16 = evt->get_cpuid();
 		return extract_single_val(m_val.u16, len);
@@ -1131,9 +1107,9 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 		}
 
 		if(resolved_argstr != NULL && resolved_argstr[0] != 0) {
-			return extract_single_cstring(resolved_argstr, len, sanitize_strings);
+			return extract_single_cstring(resolved_argstr, len);
 		} else {
-			return extract_single_cstring(argstr, len, sanitize_strings);
+			return extract_single_cstring(argstr, len);
 		}
 	} break;
 	case TYPE_INFO: {
@@ -1144,7 +1120,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 	case TYPE_ARGS: {
 		if(evt->get_type() == PPME_GENERIC_X) {
 			// Don't print the arguments for generic events: they have only internal use.
-			return extract_single_cstring("", len, sanitize_strings);
+			return extract_single_cstring("", len);
 		}
 
 		const char* resolved_argstr = NULL;
@@ -1173,7 +1149,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 		if(!m_strstorage.empty()) {
 			m_strstorage.pop_back();
 		}
-		return extract_single_string(m_strstorage, len, sanitize_strings);
+		return extract_single_string(m_strstorage, len);
 	} break;
 	case TYPE_BUFFER: {
 		if(m_is_compare) {
@@ -1208,7 +1184,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 
 		int64_t res = evt->get_syscall_return_value();
 		if(res >= 0) {
-			return extract_single_cstring("SUCCESS", len, sanitize_strings);
+			return extract_single_cstring("SUCCESS", len);
 		}
 
 		// todo!: we should check if a failed syscall can return something that is not an errno.
@@ -1217,7 +1193,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 		//
 		// m_strstorage = sinsp_utils::errno_to_str((int32_t)res);
 		m_strstorage = evt->get_param_value_str(0, true);
-		return extract_single_string(m_strstorage, len, sanitize_strings);
+		return extract_single_string(m_strstorage, len);
 	} break;
 	case TYPE_ISIO: {
 		ppm_event_flags eflags = evt->get_info_flags();
@@ -1259,7 +1235,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 			return NULL;
 		}
 
-		return extract_single_string(m_strstorage, len, sanitize_strings);
+		return extract_single_string(m_strstorage, len);
 	}
 	case TYPE_ISWAIT: {
 		ppm_event_flags eflags = evt->get_info_flags();
@@ -1276,7 +1252,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 
 		ppm_event_flags eflags = evt->get_info_flags();
 		if(eflags & EF_WRITES_TO_FD) {
-			sinsp_fdinfo* fdinfo = evt->get_fd_info();
+			const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 
 			if(fdinfo != NULL && fdinfo->is_syslog()) {
 				m_val.u32 = 1;
@@ -1292,7 +1268,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 	case TYPE_COUNT_ERROR:
 		return extract_error_count(evt, len);
 	case TYPE_COUNT_ERROR_FILE: {
-		sinsp_fdinfo* fdinfo = evt->get_fd_info();
+		const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 
 		if(fdinfo != NULL) {
 			auto ftype = fdinfo->get_type();
@@ -1311,7 +1287,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 		return NULL;
 	}
 	case TYPE_COUNT_ERROR_NET: {
-		sinsp_fdinfo* fdinfo = evt->get_fd_info();
+		const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 
 		if(fdinfo != NULL) {
 			auto ftype = fdinfo->get_type();
@@ -1339,7 +1315,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 		}
 	}
 	case TYPE_COUNT_ERROR_OTHER: {
-		sinsp_fdinfo* fdinfo = evt->get_fd_info();
+		const sinsp_fdinfo* fdinfo = evt->get_fd_info();
 
 		if(fdinfo != NULL) {
 			auto ftype = fdinfo->get_type();
@@ -1387,7 +1363,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 		return extract_single_val(m_val.u32, len);
 	}
 	case TYPE_ABSPATH:
-		return extract_abspath(evt, len, sanitize_strings);
+		return extract_abspath(evt, len);
 	case TYPE_BUFLEN_IN:
 		if(evt->get_fd_info() && evt->get_category() == EC_IO_READ) {
 			return extract_buflen(evt, len);
@@ -1540,7 +1516,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 						vector<string> subelements = sinsp_split(e, ':');
 						ASSERT(subelements.size() == 2);
 						m_strstorage = trim(subelements[1]);
-						return extract_single_string(m_strstorage, len, sanitize_strings);
+						return extract_single_string(m_strstorage, len);
 					}
 				} else if(m_field_id == TYPE_INFRA_DOCKER_CONTAINER_ID) {
 					if(e.substr(0, sizeof("ID") - 1) == "ID") {
@@ -1550,14 +1526,14 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 						if(m_strstorage.length() > 12) {
 							m_strstorage = m_strstorage.substr(0, 12);
 						}
-						return extract_single_string(m_strstorage, len, sanitize_strings);
+						return extract_single_string(m_strstorage, len);
 					}
 				} else if(m_field_id == TYPE_INFRA_DOCKER_CONTAINER_NAME) {
 					if(e.substr(0, sizeof("name") - 1) == "name") {
 						vector<string> subelements = sinsp_split(e, ':');
 						ASSERT(subelements.size() == 2);
 						m_strstorage = trim(subelements[1]);
-						return extract_single_string(m_strstorage, len, sanitize_strings);
+						return extract_single_string(m_strstorage, len);
 					}
 				} else if(m_field_id == TYPE_INFRA_DOCKER_CONTAINER_IMAGE) {
 					if(e.substr(0, sizeof("Image") - 1) == "Image") {
@@ -1571,7 +1547,7 @@ uint8_t* sinsp_filter_check_event::extract_single(sinsp_evt* evt,
 							m_strstorage = e.substr(e.find(":") + 1);
 						}
 						m_strstorage = trim(m_strstorage);
-						return extract_single_string(m_strstorage, len, sanitize_strings);
+						return extract_single_string(m_strstorage, len);
 					}
 				}
 			}
@@ -1592,10 +1568,9 @@ bool sinsp_filter_check_event::compare_nocache(sinsp_evt* evt) {
 
 	if(m_field_id == TYPE_ARGRAW) {
 		uint32_t len;
-		bool sanitize_strings = false;
 		// note: this uses the single-value extract because this filtercheck
 		// class does not support multi-valued extraction
-		uint8_t* extracted_val = extract_single(evt, &len, sanitize_strings);
+		uint8_t* extracted_val = extract_single(evt, &len);
 
 		if(extracted_val == NULL || len == 0) {
 			return false;
@@ -1603,7 +1578,12 @@ bool sinsp_filter_check_event::compare_nocache(sinsp_evt* evt) {
 
 		ASSERT(m_arginfo != NULL);
 
-		res = compare_rhs(m_cmp, m_arginfo->type, extracted_val);
+		// The length matters twice here. flt_cast's own comment names this field family as the
+		// reason it clamps a read to the value's length -- a parameter narrower than the type the
+		// filter compiled against -- and passing nothing left that clamp dead on the one path it
+		// was written for. It is also what a resolved comparison shape checks before trusting a
+		// value, so without it an integer raw argument could never take the fast path.
+		res = compare_rhs(m_cmp, m_arginfo->type, extracted_val, len);
 	} else if(m_field_id == TYPE_AROUND) {
 		uint64_t ts = evt->get_ts();
 		uint64_t t1 = ts - m_tsdelta;

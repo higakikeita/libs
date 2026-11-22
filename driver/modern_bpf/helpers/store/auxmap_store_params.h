@@ -59,13 +59,79 @@
 // GET AUXILIARY MAP
 ////////////////////////////////
 
-/**
- * @brief Get the auxiliary map pointer for the current CPU.
+/* Take this segment if it is free, or already ours.
  *
- * @return pointer to the auxmap
+ * The claim has to be indivisible: the filler can be preempted between reading the owner and
+ * writing it, and two tasks that both come out of that window holding the same segment write
+ * over each other's event. cmpxchg is the whole point of this function.
+ *
+ * The non-atomic path is only selected on kernels without the 5.12 atomics, and there the
+ * tracepoint holds preemption off around the probe, so a filler cannot be interrupted mid-claim
+ * and the store cannot race. See g_bpf_atomics.
  */
-static __always_inline struct auxiliary_map *auxmap__get() {
-	return maps__get_auxiliary_map();
+static __always_inline bool auxmap__claim(struct auxiliary_map *auxmap, uint64_t me) {
+	if(g_bpf_atomics) {
+		const uint64_t prev = __sync_val_compare_and_swap(&auxmap->owner, 0, me);
+		return prev == 0 || prev == me;
+	}
+
+	const uint64_t owner = READ_ONCE(auxmap->owner);
+	if(owner != 0 && owner != me) {
+		return false;
+	}
+	WRITE_ONCE(auxmap->owner, me);
+	return true;
+}
+
+/* Claim a segment of this CPU's pool for this task. A segment this task already owns counts as
+ * free, so one left claimed by a build that never reached submit is reused rather than stranded.
+ *
+ * @return the claimed segment, or NULL if none is free.
+ */
+static __always_inline struct auxiliary_map *auxmap__get(void) {
+	const uint64_t me = bpf_get_current_pid_tgid();
+	const uint32_t base = maps__auxiliary_map_base();
+
+	/* Search by index, look up once afterwards: see auxmap__resume(). DEPTH means "none". */
+	uint32_t slot = AUXMAP_POOL_DEPTH;
+
+#pragma clang loop unroll(full)
+	for(uint32_t i = 0; i < AUXMAP_POOL_DEPTH; i++) {
+		if(slot != AUXMAP_POOL_DEPTH) {
+			continue;
+		}
+		struct auxiliary_map *auxmap = maps__get_auxiliary_map_slot(base + i);
+		if(!auxmap) {
+			/* For the verifier only; the map is sized n_possible_cpus *
+			 * AUXMAP_POOL_DEPTH. Break, not continue: a lookup only fails past
+			 * max_entries. */
+			break;
+		}
+		if(auxmap__claim(auxmap, me)) {
+			slot = i;
+		}
+	}
+
+	/* Every segment is in use, so drop this event. */
+	if(slot == AUXMAP_POOL_DEPTH) {
+		struct counter_map *counter = maps__get_counter_map();
+		if(counter) {
+			/* Attempted before dropped, and never one without the other: consumers divide
+			 * n_drops by n_evts and require every drop to be in both. */
+			counter->n_evts++;
+			counter->n_drops_auxmap_pool_full++;
+		}
+		return NULL;
+	}
+
+	/* Cannot fail: slot came from a lookup that already succeeded. */
+	return maps__get_auxiliary_map_slot(base + slot);
+}
+
+/* Release the claim. Until this runs, a build arriving on this CPU takes another segment.
+ */
+static __always_inline void auxmap__put(struct auxiliary_map *auxmap) {
+	WRITE_ONCE(auxmap->owner, 0);
 }
 
 #ifdef BPF_ITERATOR_SUPPORT
@@ -92,15 +158,125 @@ static __always_inline struct auxiliary_map *auxmap_iter__get() {
  */
 static __always_inline void auxmap__preload_event_header(struct auxiliary_map *auxmap,
                                                          uint16_t event_type) {
-	struct ppm_evt_hdr *hdr = (struct ppm_evt_hdr *)auxmap->data;
 	uint8_t nparams = maps__get_event_num_params(event_type);
-	hdr->ts = maps__get_boot_time() + bpf_ktime_get_boot_ns();
-	hdr->tid = bpf_get_current_pid_tgid() & 0xffffffff;
-	hdr->type = event_type;
-	hdr->nparams = nparams;
+
+	/*
+	 * Avoid byte-by-byte stores from writing packed header fields directly.
+	 * `struct ppm_evt_hdr` is packed, so field assignments can be lowered to
+	 * byte stores. By building the header as a local value and copying it with
+	 * __builtin_memcpy, clang can lower the copy into wider stores at naturally
+	 * aligned destination offsets (ts/tid/len/type).
+	 */
+	struct ppm_evt_hdr hdr = {0};
+	hdr.ts = maps__get_boot_time() + bpf_ktime_get_boot_ns();
+	hdr.tid = bpf_get_current_pid_tgid() & 0xffffffff;
+	hdr.type = event_type;
+	hdr.nparams = nparams;
+	__builtin_memcpy(&auxmap->data[0], &hdr, sizeof(struct ppm_evt_hdr));
+
 	auxmap->payload_pos = sizeof(struct ppm_evt_hdr) + nparams * sizeof(uint16_t);
 	auxmap->lengths_pos = sizeof(struct ppm_evt_hdr);
 	auxmap->event_type = event_type;
+}
+
+/* Find a segment this task owns anywhere in the array, rather than in this CPU's pool.
+ *
+ * Inlined, even though it only runs for a build that changed CPU and a subprogram would be
+ * walked once per program instead of once per resume site: every caller of auxmap__resume()
+ * tail-calls, and a program that both tail-calls and calls a subprogram is rejected unless the
+ * JIT compiled it. Nothing else in the probe pairs the two, and needing a working JIT to load at
+ * all is the worse trade.
+ *
+ * @return the index into `auxiliary_maps`, or AUXMAP_POOL_NO_SLOT if this task owns nothing.
+ */
+static __always_inline uint32_t auxmap__find_owned_slot(const uint64_t me) {
+	const uint32_t entries = g_auxmap_pool_entries;
+
+	for(uint32_t i = 0; i < entries; i++) {
+		struct auxiliary_map *auxmap = maps__get_auxiliary_map_slot(i);
+		if(!auxmap) {
+			/* For the verifier only: the bound is the array's own size. */
+			break;
+		}
+		if(READ_ONCE(auxmap->owner) == me) {
+			return i;
+		}
+	}
+	return AUXMAP_POOL_NO_SLOT;
+}
+
+/* The segment this build already owns in this CPU's pool, claiming nothing.
+ *
+ * For code that runs in the middle of a build and cannot be handed the pointer -- a bpf_loop
+ * callback, whose context cannot carry a map value pointer. Such code must not call
+ * auxmap__get(): that claims, and "a segment this task already owns counts as free" only makes
+ * it return the right one when the build happens to hold the first free slot.
+ *
+ * @return the segment, or NULL if this CPU's pool holds none of this task's.
+ */
+static __always_inline struct auxiliary_map *auxmap__owned(void) {
+	const uint64_t me = bpf_get_current_pid_tgid();
+	const uint32_t base = maps__auxiliary_map_base();
+
+	/* An index out of the loop rather than a pointer: a map value pointer per iteration
+	 * multiplies the verifier's work by the slot count, which recvmmsg_x cannot afford. */
+	uint32_t slot = AUXMAP_POOL_DEPTH;
+
+#pragma clang loop unroll(full)
+	for(uint32_t i = 0; i < AUXMAP_POOL_DEPTH; i++) {
+		if(slot != AUXMAP_POOL_DEPTH) {
+			continue;
+		}
+		struct auxiliary_map *auxmap = maps__get_auxiliary_map_slot(base + i);
+		if(auxmap && READ_ONCE(auxmap->owner) == me) {
+			slot = i;
+		}
+	}
+
+	if(slot == AUXMAP_POOL_DEPTH) {
+		return NULL;
+	}
+	return maps__get_auxiliary_map_slot(base + slot);
+}
+
+/**
+ * @brief Recover the segment this build was using, at the top of a tail-called continuation.
+ * The BPF stack does not survive a tail call and ctx is read-only, so it is found by owner.
+ *
+ * @return the segment, or NULL if this build lost it: the caller must return without submitting.
+ */
+static __always_inline struct auxiliary_map *auxmap__resume(void) {
+	struct auxiliary_map *auxmap = auxmap__owned();
+	if(auxmap) {
+		return auxmap;
+	}
+
+	/* Not in this CPU's pool, which does not mean the segment is gone: a preempted filler can
+	 * also have been migrated -- a BPF program on a tracepoint is only pinned to its CPU from
+	 * 7.0 -- and then this is the wrong pool to look in. */
+	const uint32_t owned = auxmap__find_owned_slot(bpf_get_current_pid_tgid());
+	if(owned != AUXMAP_POOL_NO_SLOT) {
+		auxmap = maps__get_auxiliary_map_slot(owned);
+		if(auxmap) {
+			struct counter_map *counter = maps__get_counter_map();
+			if(counter) {
+				counter->n_auxmap_migrations++;
+			}
+			return auxmap;
+		}
+	}
+
+	/* The build this was continuing is gone: another event claimed its segment while it was
+	 * suspended. Counted as attempted here rather than at auxmap__submit_event(), which this
+	 * build will never reach, and in both drop counters, the tail-call count being a subset of
+	 * the total. */
+	struct counter_map *counter = maps__get_counter_map();
+	if(counter) {
+		counter->n_evts++;
+		counter->n_drops_auxmap_reentrancy++;
+		counter->n_drops_auxmap_reentrancy_tail_call++;
+	}
+	return NULL;
 }
 
 #ifdef BPF_ITERATOR_SUPPORT
@@ -190,14 +366,33 @@ static __always_inline void auxmap__submit_event_to_ringbuf(struct auxiliary_map
 }
 
 static __always_inline void auxmap__submit_event(struct auxiliary_map *auxmap) {
+	struct counter_map *counter = maps__get_counter_map();
+
+	if(READ_ONCE(auxmap->owner) != bpf_get_current_pid_tgid()) {
+		if(counter) {
+			/* The n_evts++ below is unreachable now, so count the attempt here: this event
+			 * was built, it just cannot be shipped. */
+			counter->n_evts++;
+			counter->n_drops_auxmap_reentrancy++;
+		}
+		return;
+	}
+
+	if(!counter) {
+		auxmap__put(auxmap);
+		return;
+	}
+
 	struct ringbuf_map *rb = maps__get_ringbuf_map();
 	if(!rb) {
 		/* This should never happen in tail-called exit programs because we check it in `sys_exit`
 		 * dispatcher. It can happen in TOCTOU mitigation programs. */
 		bpf_printk("FAILURE: unable to obtain the ring buffer");
+		auxmap__put(auxmap);
 		return;
 	}
 	auxmap__submit_event_to_ringbuf(auxmap, rb);
+	auxmap__put(auxmap);
 }
 
 /**
@@ -210,12 +405,29 @@ static __always_inline void auxmap__submit_event(struct auxiliary_map *auxmap) {
  */
 static __always_inline void auxmap__submit_event_for_tgid(struct auxiliary_map *auxmap,
                                                           uint32_t tgid) {
+	struct counter_map *counter = maps__get_counter_map();
+
+	if(READ_ONCE(auxmap->owner) != bpf_get_current_pid_tgid()) {
+		if(counter) {
+			counter->n_evts++;
+			counter->n_drops_auxmap_reentrancy++;
+		}
+		return;
+	}
+
+	if(!counter) {
+		auxmap__put(auxmap);
+		return;
+	}
+
 	struct ringbuf_map *rb = maps__get_ringbuf_map_for_tgid(tgid);
 	if(!rb) {
 		bpf_printk("FAILURE: unable to obtain the ring buffer for tgid %u", tgid);
+		auxmap__put(auxmap);
 		return;
 	}
 	auxmap__submit_event_to_ringbuf(auxmap, rb);
+	auxmap__put(auxmap);
 }
 
 #ifdef BPF_ITERATOR_SUPPORT
@@ -1371,6 +1583,148 @@ static __always_inline void auxmap__store_iovec_data_param(struct auxiliary_map 
 		auxmap__store_iovec_data_param_64(auxmap, iov_pointer, iov_cnt, len_to_read);
 	} else {
 		auxmap__store_iovec_data_param_32(auxmap, iov_pointer, iov_cnt, len_to_read);
+	}
+}
+
+/* bpf_loop()-based variant of the native iovec data store, for use inside the
+ * sendmmsg_x/recvmmsg_x bpf_loop callbacks.
+ *
+ * The plain for(j < MAX_IOVCNT) loop in auxmap__store_iovec_data_param_64 is a
+ * bounded loop. When it sits inside a bpf_loop callback, stricter kernel
+ * verifiers re-explore the whole 32-iteration loop on every fixed-point pass of
+ * the outer callback, multiplying processed instructions. Replacing it with a
+ * bpf_loop helper makes the verifier check the per-iteration body once instead,
+ * collapsing that multiplication and keeping the program under the
+ * processed-instruction limit.
+ *
+ * The loop callback cannot carry a map-value (auxmap) pointer through the
+ * bpf_loop context, so it re-fetches this build's segment via auxmap__owned()
+ * and re-derives the iovec scratch area. It must not use auxmap__get(): that
+ * claims a segment, and the one it claims is the first free slot, which is this
+ * build's only when the build holds the first slot. Mutable loop state lives in
+ * the context. */
+typedef struct {
+	unsigned long iov_cnt;
+	unsigned long len_to_read;
+	unsigned long total_size_to_read;
+	bool truncated;
+} iovec_data_loop_ctx_t;
+
+static long iovec_data_loop_callback(uint32_t index, void *ctx) {
+	iovec_data_loop_ctx_t *c = (iovec_data_loop_ctx_t *)ctx;
+
+	if(c->total_size_to_read > c->len_to_read) {
+		c->total_size_to_read = c->len_to_read;
+		return 1;
+	}
+	if(index >= c->iov_cnt) {
+		return 1;
+	}
+
+	struct auxiliary_map *auxmap = auxmap__owned();
+	if(!auxmap) {
+		return 1;
+	}
+
+	/* Mask the index so the verifier can bound the map-value access. */
+	uint32_t j = index & (MAX_IOVCNT - 1);
+	const struct iovec *iovec = (const struct iovec *)&auxmap->data[MAX_PARAM_SIZE];
+
+	uint16_t bytes_read = push__bytebuf(auxmap->data,
+	                                    &auxmap->payload_pos,
+	                                    (unsigned long)iovec[j].iov_base,
+	                                    iovec[j].iov_len,
+	                                    USER);
+	if(!bytes_read) {
+		c->truncated = true;
+		return 1;
+	}
+	c->total_size_to_read += bytes_read;
+	return 0;
+}
+
+static __noinline void auxmap__store_iovec_data_param_64_bpf_loop(struct auxiliary_map *auxmap,
+                                                                  unsigned long iov_pointer,
+                                                                  unsigned long iov_cnt,
+                                                                  unsigned long len_to_read) {
+	/* We use the second part of our auxmap as a scratch space. */
+	unsigned long total_iovec_size = iov_cnt * bpf_core_type_size(struct iovec);
+
+	if(bpf_probe_read_user((void *)&auxmap->data[MAX_PARAM_SIZE],
+	                       SAFE_ACCESS(total_iovec_size),
+	                       (void *)iov_pointer)) {
+		/* in case of NULL iovec vector we return an empty param */
+		push__param_len(auxmap->data, &auxmap->lengths_pos, 0);
+		return;
+	}
+
+	uint64_t initial_payload_pos = auxmap->payload_pos;
+	iovec_data_loop_ctx_t ctx = {
+	        .iov_cnt = iov_cnt,
+	        .len_to_read = len_to_read,
+	        .total_size_to_read = 0,
+	        .truncated = false,
+	};
+
+	bpf_loop(MAX_IOVCNT, iovec_data_loop_callback, &ctx, 0);
+
+	/* Same len enforcement as the for-loop version: when we did not stop early
+	 * on a failed read, clamp payload_pos so we never exceed len_to_read. */
+	if(!ctx.truncated) {
+		auxmap->payload_pos = initial_payload_pos + ctx.total_size_to_read;
+	}
+	push__param_len(auxmap->data, &auxmap->lengths_pos, ctx.total_size_to_read);
+}
+
+/* Native bpf_loop iovec store wrapped in a __noinline boundary. handle_exit()
+ * for sendmmsg_x/recvmmsg_x runs as a bpf_loop callback, and stricter verifiers
+ * re-explore everything INLINED into that callback on every SCC fixed-point
+ * pass. Keeping the ia32 dispatch and the bpf_loop call behind a __noinline
+ * function means they are verified once instead of being multiplied by that
+ * re-exploration — which is what keeps the program under the 1M
+ * processed-instruction limit. */
+static __noinline void auxmap__store_iovec_data_param_mmsg_bpf_loop(struct auxiliary_map *auxmap,
+                                                                    unsigned long iov_pointer,
+                                                                    unsigned long iov_cnt,
+                                                                    unsigned long len_to_read) {
+	if(bpf_in_ia32_syscall()) {
+		/* ia32 (compat) path keeps the bounded for-loop (rare; compat layout). */
+		auxmap__store_iovec_data_param_32(auxmap, iov_pointer, iov_cnt, len_to_read);
+	} else {
+		auxmap__store_iovec_data_param_64_bpf_loop(auxmap, iov_pointer, iov_cnt, len_to_read);
+	}
+}
+
+/* Defined later in this header; used by the selector below for the legacy path. */
+static __noinline void auxmap__store_iovec_data_param_noinline(struct auxiliary_map *auxmap,
+                                                               unsigned long iov_pointer,
+                                                               unsigned long iov_cnt,
+                                                               unsigned long len_to_read);
+
+/* mmsg iovec data store selector. handle_exit() is shared by the bpf_loop
+ * programs (sendmmsg_x/recvmmsg_x, loaded only when the bpf_loop helper is
+ * available) and the legacy single-message programs
+ * (sendmmsg_old_x/recvmmsg_old_x, loaded when it is NOT).
+ *
+ * `use_bpf_loop` is a compile-time constant supplied by each caller, NOT a CO-RE
+ * feature probe: some kernels expose BPF_FUNC_loop in their BTF enum without
+ * implementing the helper, so bpf_core_enum_value_exists() would wrongly route
+ * the legacy program through bpf_loop and fail to load with "invalid func
+ * unknown#181". Because the constant is propagated through this __always_inline
+ * selector, it collapses to a single call to the matching __noinline store: the
+ * legacy program references only the for-loop store (never the bpf_loop helper,
+ * independent of BTF), while the bpf_loop program keeps the __noinline boundary
+ * that bounds its verifier work. The legacy path handles a single message and is
+ * not subject to the SCC blowup, so the for-loop store is correct there. */
+static __always_inline void auxmap__store_iovec_data_param_mmsg(struct auxiliary_map *auxmap,
+                                                                unsigned long iov_pointer,
+                                                                unsigned long iov_cnt,
+                                                                unsigned long len_to_read,
+                                                                bool use_bpf_loop) {
+	if(use_bpf_loop) {
+		auxmap__store_iovec_data_param_mmsg_bpf_loop(auxmap, iov_pointer, iov_cnt, len_to_read);
+	} else {
+		auxmap__store_iovec_data_param_noinline(auxmap, iov_pointer, iov_cnt, len_to_read);
 	}
 }
 

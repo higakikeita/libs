@@ -1,5 +1,7 @@
 #include <libsinsp/linux/resource_utilization.h>
+#include <libsinsp/procfs_utils.h>
 
+#include <fstream>
 #include <sys/times.h>
 
 void linux_resource_utilization::get_rss_vsz_pss_total_memory_and_open_fds() {
@@ -253,37 +255,50 @@ std::vector<metrics_v2> linux_resource_utilization::to_metrics() {
 	return metrics;
 }
 
+static bool read_cgroup_memory_used(const char* filepath, uint64_t& memory_used) {
+	FILE* f = fopen(filepath, "r");
+	if(!f) {
+		return false;
+	}
+
+	/* memory size returned in bytes */
+	int fscanf_matched = fscanf(f, "%" SCNu64, &memory_used);
+	if(fscanf_matched != 1) {
+		memory_used = 0;
+	}
+
+	fclose(f);
+	return true;
+}
+
 void linux_resource_utilization::get_container_memory_used() {
 	/* In Kubernetes `container_memory_working_set_bytes` is the memory measure the OOM killer uses
-	 * and values from `/sys/fs/cgroup/memory/memory.usage_in_bytes` are close enough.
+	 * and values from `memory.usage_in_bytes` (cgroup v1) or `memory.current` (cgroup v2) are close
+	 * enough.
 	 *
 	 * Please note that `kubectl top pod` numbers would reflect the sum of containers in a pod and
 	 * typically libs clients (e.g. Falco) pods contain sidekick containers that use memory as well.
 	 * This metric accounts only for the container with the security monitoring agent running.
 	 */
 	const char* filepath = getenv(SINSP_AGENT_CGROUP_MEM_PATH_ENV_VAR);
-	if(filepath == nullptr) {
-		// No need for scap_get_host_root since we look at the container pid namespace (if
-		// applicable) Known collision for VM memory usage, but this default value is configurable
-		filepath = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
-	} else {
-		// Path validation to prevent directory traversal or empty paths
-		if(strstr(filepath, "..") != nullptr || strlen(filepath) == 0) {
-			// Fall back to default safe path if validation fails
-			filepath = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
-		}
-	}
-
-	FILE* f = fopen(filepath, "r");
-	if(!f) {
+	// Path validation to prevent directory traversal or empty paths
+	if(filepath != nullptr && strstr(filepath, "..") == nullptr && strlen(filepath) != 0) {
+		read_cgroup_memory_used(filepath, m_container_memory_used);
 		return;
 	}
 
-	/* memory size returned in bytes */
-	int fscanf_matched = fscanf(f, "%" SCNu64, &m_container_memory_used);
-	if(fscanf_matched != 1) {
-		m_container_memory_used = 0;
+	// No need for scap_get_host_root since we look at the container pid namespace (if
+	// applicable) Known collision for VM memory usage, but this default value is configurable
+	if(read_cgroup_memory_used("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+	                           m_container_memory_used)) {
+		return;
 	}
 
-	fclose(f);
+	// cgroup v2: the agent's own cgroup is the `0::<path>` line of /proc/self/cgroup
+	std::ifstream proc_cgroup("/proc/self/cgroup");
+	std::string cgroup_filepath =
+	        libsinsp::procfs_utils::get_cgroup_v2_memory_current_path(proc_cgroup);
+	if(!cgroup_filepath.empty()) {
+		read_cgroup_memory_used(cgroup_filepath.c_str(), m_container_memory_used);
+	}
 }

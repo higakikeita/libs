@@ -275,10 +275,6 @@ void sinsp_parser::process_event(sinsp_evt &evt, sinsp_parser_verdict &verdict) 
 	default:
 		break;
 	}
-
-	if(evt.get_fd_info()) {
-		evt.set_fdinfo_name_changed(evt.get_fd_info()->consume_name_changed());
-	}
 }
 
 void sinsp_parser::event_cleanup(sinsp_evt &evt) {
@@ -577,6 +573,15 @@ bool sinsp_parser::retrieve_enter_event(sinsp_evt &enter_evt, sinsp_evt &exit_ev
 // PARSERS
 ///////////////////////////////////////////////////////////////////////////////
 
+// The time between the start of the pid namespace and the last status change of the executable, if
+// the change came after the start.
+static void update_exe_ino_ctime_duration_pidns_start(sinsp_threadinfo &tinfo) {
+	if(tinfo.m_pidns_init_start_ts != 0 && tinfo.get_exe_ino_ctime() > tinfo.m_pidns_init_start_ts) {
+		tinfo.set_exe_ino_ctime_duration_pidns_start(tinfo.get_exe_ino_ctime() -
+		                                             tinfo.m_pidns_init_start_ts);
+	}
+}
+
 void sinsp_parser::parse_clone_exit_caller(sinsp_evt &evt,
                                            sinsp_parser_verdict &verdict,
                                            const int64_t child_tid) const {
@@ -749,7 +754,14 @@ void sinsp_parser::parse_clone_exit_caller(sinsp_evt &evt,
 	 * threadinfo entry that leaks memory until the next autopurge cycle.
 	 * See: https://github.com/falcosecurity/falco/issues/3643
 	 */
-	if(m_params->m_thread_manager->has_recently_exited(child_tid, caller_tid, evt.get_ts())) {
+	/* The ptid of the child is its real_parent in the kernel: the parent of the caller for a new
+	 * thread or with CLONE_PARENT, else the caller. The child's own clone event reports it, and
+	 * that is the ptid recorded when the child exited.
+	 */
+	const int64_t child_ptid = (flags & (PPM_CL_CLONE_THREAD | PPM_CL_CLONE_PARENT))
+	                                   ? caller_tinfo->get_ptid()
+	                                   : caller_tid;
+	if(m_params->m_thread_manager->has_recently_exited(child_tid, child_ptid, evt.get_ts())) {
 		return;
 	}
 
@@ -815,29 +827,20 @@ void sinsp_parser::parse_clone_exit_caller(sinsp_evt &evt,
 		 * of the main thread.
 		 */
 		if(valid_caller) {
-			/* Copy the fd list:
-			 * XXX this is a gross oversimplification that will need to be fixed.
-			 * What we do is: if the child is NOT a thread, we copy all the parent fds.
-			 * The right thing to do is looking at PPM_CL_CLONE_FILES, but there are
-			 * syscalls like open and pipe2 that can override PPM_CL_CLONE_FILES with the O_CLOEXEC
-			 * flag
+			/* Share the fd table:
+			 * The child sees the same entries as the parent; the first
+			 * modification through either table detaches a private copy
+			 * (copy-on-write), so no per-fork copy is paid here.
+			 * XXX like the eager copy this replaces, sharing for every
+			 * non-thread child is an oversimplification. The right thing to
+			 * do is looking at PPM_CL_CLONE_FILES, but there are syscalls
+			 * like open and pipe2 that can override PPM_CL_CLONE_FILES with
+			 * the O_CLOEXEC flag
 			 */
-			sinsp_fdtable *fd_table_ptr = caller_tinfo->get_fd_table();
+			const sinsp_fdtable *fd_table_ptr = caller_tinfo->get_fd_table();
 			if(fd_table_ptr != nullptr) {
-				child_tinfo->get_fdtable().clear();
 				child_tinfo->get_fdtable().set_tid(child_tinfo->m_tid);
-				fd_table_ptr->const_loop([&child_tinfo](int64_t fd, const sinsp_fdinfo &info) {
-					/* Track down that those are cloned fds */
-					auto newinfo = info.clone();
-					newinfo->set_is_cloned();
-					child_tinfo->get_fdtable().add(fd, std::move(newinfo));
-					return true;
-				});
-
-				/* It's important to reset the cache of the child thread, to prevent it from
-				 * referring to an element in the parent's table.
-				 */
-				child_tinfo->get_fdtable().reset_cache();
+				child_tinfo->get_fdtable().share_from(*fd_table_ptr);
 			} else {
 				/* This should never happen */
 				libsinsp_logger()->format(sinsp_logger::SEV_DEBUG,
@@ -993,6 +996,8 @@ void sinsp_parser::parse_clone_exit_caller(sinsp_evt &evt,
 
 		child_tinfo->set_exe_ino_ctime_duration_clone_ts(
 		        caller_tinfo->get_exe_ino_ctime_duration_clone_ts());
+
+		update_exe_ino_ctime_duration_pidns_start(*child_tinfo);
 	} else {
 		/* exe */
 		caller_tinfo->set_exe(child_tinfo->get_exe());
@@ -1260,31 +1265,20 @@ void sinsp_parser::parse_clone_exit_child(sinsp_evt &evt, sinsp_parser_verdict &
 			 * of the main thread.
 			 */
 
-			/* Copy the fd list:
-			 * XXX this is a gross oversimplification that will need to be fixed.
-			 * What we do is: if the child is NOT a thread, we copy all the parent fds.
-			 * The right thing to do is looking at PPM_CL_CLONE_FILES, but there are
-			 * syscalls like open and pipe2 that can override PPM_CL_CLONE_FILES with the O_CLOEXEC
-			 * flag
+			/* Share the fd table:
+			 * The child sees the same entries as the parent; the first
+			 * modification through either table detaches a private copy
+			 * (copy-on-write), so no per-fork copy is paid here.
+			 * XXX like the eager copy this replaces, sharing for every
+			 * non-thread child is an oversimplification. The right thing to
+			 * do is looking at PPM_CL_CLONE_FILES, but there are syscalls
+			 * like open and pipe2 that can override PPM_CL_CLONE_FILES with
+			 * the O_CLOEXEC flag
 			 */
-			sinsp_fdtable *fd_table_ptr = lookup_tinfo->get_fd_table();
+			const sinsp_fdtable *fd_table_ptr = lookup_tinfo->get_fd_table();
 			if(fd_table_ptr != nullptr) {
-				child_tinfo->get_fdtable().clear();
 				child_tinfo->get_fdtable().set_tid(child_tinfo->m_tid);
-				fd_table_ptr->const_loop([&child_tinfo](int64_t fd, const sinsp_fdinfo &info) {
-					/* Track down that those are cloned fds.
-					 * This flag `FLAGS_IS_CLONED` seems to be never used...
-					 */
-					auto newinfo = info.clone();
-					newinfo->set_is_cloned();
-					child_tinfo->get_fdtable().add(fd, std::move(newinfo));
-					return true;
-				});
-
-				/* It's important to reset the cache of the child thread, to prevent it from
-				 * referring to an element in the parent's table.
-				 */
-				child_tinfo->get_fdtable().reset_cache();
+				child_tinfo->get_fdtable().share_from(*fd_table_ptr);
 			} else {
 				/* This should never happen */
 				libsinsp_logger()->format(sinsp_logger::SEV_DEBUG,
@@ -1374,6 +1368,7 @@ void sinsp_parser::parse_clone_exit_child(sinsp_evt &evt, sinsp_parser_verdict &
 	} else {
 		child_tinfo->m_pidns_init_start_ts = m_params->m_machine_info->boot_ts_epoch;
 	}
+	update_exe_ino_ctime_duration_pidns_start(*child_tinfo);
 
 	/*=============================== CREATE NEW THREAD-INFO ===========================*/
 
@@ -1432,7 +1427,10 @@ void sinsp_parser::parse_clone_exit(sinsp_evt &evt, sinsp_parser_verdict &verdic
 	} else {
 		parse_clone_exit_caller(evt, verdict, childtid);
 	}
-	return;
+
+	if(auto *tinfo = evt.get_tinfo(); tinfo != nullptr) {
+		m_params->m_thread_manager->update_parent_link(*tinfo);
+	}
 }
 
 void sinsp_parser::parse_execve_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict) const {
@@ -1457,6 +1455,8 @@ void sinsp_parser::parse_execve_exit(sinsp_evt &evt, sinsp_parser_verdict &verdi
 		// %s\n",evt.get_param(1)->data()),evt.get_param(1)->data())); ASSERT(false);
 		return;
 	}
+
+	m_params->m_thread_manager->update_parent_link(*evt.get_tinfo());
 
 	/* In some corner cases an execve is thrown by a secondary thread when
 	 * the main thread is already dead. In these cases the secondary thread
@@ -1600,11 +1600,11 @@ void sinsp_parser::parse_execve_exit(sinsp_evt &evt, sinsp_parser_verdict &verdi
 					fullpath = "<NA>";
 				}
 				/* (3) In this case we have already obtained the `exepath` and it is `sdir`, we just
-				 * need to sanitize it.
+				 * need to normalize it.
 				 */
 				else if(flags & PPM_EXVAT_AT_EMPTY_PATH) {
 					/* In this case `sdir` will always be an absolute path.
-					 * concatenate_paths takes care of resolving the path
+					 * concatenate_paths takes care of normalizing the path.
 					 */
 					fullpath = sinsp_utils::concatenate_paths("", sdir);
 				}
@@ -1642,11 +1642,7 @@ void sinsp_parser::parse_execve_exit(sinsp_evt &evt, sinsp_parser_verdict &verdi
 			state.exe_ino_ctime_duration_clone_ts =
 			        evt.get_tinfo()->get_clone_ts() - *state.exe_ino_ctime;
 		}
-		if(evt.get_tinfo()->m_pidns_init_start_ts != 0 &&
-		   *state.exe_ino_ctime > evt.get_tinfo()->m_pidns_init_start_ts) {
-			state.exe_ino_ctime_duration_pidns_start =
-			        *state.exe_ino_ctime - evt.get_tinfo()->m_pidns_init_start_ts;
-		}
+		update_exe_ino_ctime_duration_pidns_start(*evt.get_tinfo());
 	}
 
 	evt.get_tinfo()->apply_exec_state(state);
@@ -1720,7 +1716,7 @@ void sinsp_parser::parse_execve_exit(sinsp_evt &evt, sinsp_parser_verdict &verdi
 	//
 	// Purge CLOEXEC FDs on successful execve/execveat
 	//
-	if(auto *fd_table = evt.get_tinfo()->get_fd_table(); fd_table != nullptr) {
+	if(auto *fd_table = evt.get_tinfo()->get_fd_table_mut(); fd_table != nullptr) {
 		fd_table->retain(
 		        [&](int64_t fd, const sinsp_fdinfo &info) { return !info.is_close_on_exec(); });
 	}
@@ -2239,6 +2235,8 @@ void sinsp_parser::parse_bind_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 
 	const auto packed_data = reinterpret_cast<const uint8_t *>(addr_param->data());
 
+	sinsp_fdinfo *fdinfo = evt.get_fd_info_mut();
+
 	// Update the FD info with this tuple, assume that if port > 0, means that the socket is used
 	// for listening.
 	if(const auto family = *packed::generic_sockaddr::family(packed_data); family == PPM_AF_INET) {
@@ -2247,7 +2245,7 @@ void sinsp_parser::parse_bind_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 		memcpy(&ip, packed::in_sockaddr::ip(packed_data), sizeof(ip));
 		memcpy(&port, packed::in_sockaddr::port(packed_data), sizeof(port));
 		if(port > 0) {
-			auto fdi = evt.get_fd_info();
+			auto fdi = evt.get_fd_info_mut();
 			[[maybe_unused]] auto lock = fdi->write_guard();
 			fdi->m_type = SCAP_FD_IPV4_SERVSOCK;
 			fdi->m_sockinfo.m_ipv4serverinfo.m_ip = ip;
@@ -2261,7 +2259,7 @@ void sinsp_parser::parse_bind_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 		uint16_t port;
 		memcpy(&port, packed::in6_sockaddr::port(packed_data), sizeof(uint16_t));
 		if(port > 0) {
-			auto fdi = evt.get_fd_info();
+			auto fdi = evt.get_fd_info_mut();
 			[[maybe_unused]] auto lock = fdi->write_guard();
 			if(sinsp_utils::is_ipv4_mapped_ipv6(ip)) {
 				fdi->m_type = SCAP_FD_IPV4_SERVSOCK;
@@ -2282,7 +2280,7 @@ void sinsp_parser::parse_bind_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 		}
 	}
 	const char *parstr;
-	evt.get_fd_info()->set_name(evt.get_param_as_str(1, &parstr, sinsp_evt::PF_SIMPLE));
+	evt.get_fd_info_mut()->set_name(evt.get_param_as_str(1, &parstr, sinsp_evt::PF_SIMPLE));
 
 	// If there's a listener, add a callback to later invoke it.
 	if(m_params->m_observer) {
@@ -2292,7 +2290,7 @@ void sinsp_parser::parse_bind_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 }
 
 void sinsp_parser::fill_client_socket_info_from_addr(sinsp_evt &evt, const uint8_t *packed_data) {
-	const auto fdinfo = evt.get_fd_info();
+	const auto fdinfo = evt.get_fd_info_mut();
 	[[maybe_unused]] auto lock = fdinfo->write_guard();
 	auto &sockinfo = fdinfo->m_sockinfo;
 	switch(const uint8_t family = *packed::generic_sockaddr::family(packed_data); family) {
@@ -2399,16 +2397,14 @@ void sinsp_parser::resolve_connect_unix_destination(const uint8_t *tuple_data,
 	// the tuple destination path is taken from kernel data, so it is safe to use this latter one.
 	// Otherwise, always rely on the enter event path, which is not susceptible to changes in the
 	// context of TOCTOU attacks.
-	const auto *tuple_dpath =
-	        reinterpret_cast<const char *>(packed::un_socktuple::dpath(tuple_data));
+	const auto *tuple_dpath = packed::un_socktuple::dpath(tuple_data);
 
 	if(!exit_addr_data || !enter_addr_data) {
 		dpath = tuple_dpath;
 		return;
 	}
 
-	const auto *exit_addr_dpath =
-	        reinterpret_cast<const char *>(packed::un_sockaddr::dpath(exit_addr_data));
+	const auto *exit_addr_dpath = packed::un_sockaddr::dpath(exit_addr_data);
 #define UNIX_PATH_MAX 108  // Taken from kernel code.
 	if(std::strncmp(tuple_dpath, exit_addr_dpath, UNIX_PATH_MAX)) {
 		dpath = tuple_dpath;
@@ -2416,28 +2412,23 @@ void sinsp_parser::resolve_connect_unix_destination(const uint8_t *tuple_data,
 	}
 #undef UNIX_PATH_MAX
 
-	dpath = reinterpret_cast<const char *>(packed::un_sockaddr::dpath(enter_addr_data));
+	dpath = packed::un_sockaddr::dpath(enter_addr_data);
 }
 
-const char *sinsp_parser::encode_unix_tuple_fd_name(sinsp_evt &evt,
-                                                    const uint64_t src,
+std::string sinsp_parser::encode_unix_tuple_fd_name(const uint64_t src,
                                                     const uint64_t dst,
                                                     const char *path) {
-	// Sanitize the file string.
-	std::string sanitized_path_storage;
-	const auto sanitized_path = sanitize_string(path, sanitized_path_storage);
-
-	auto &storage = evt.get_paramstr_storage();
-
-	// Taken from `sinsp_evt::get_param_as_str()` implementation.
-	snprintf(&storage[0],
-	         storage.size(),
-	         "%" PRIx64 "->%" PRIx64 " %s",
-	         src,
-	         dst,
-	         sanitized_path.data());
-
-	return &storage[0];
+	// Inspired by `sinsp_evt::get_param_as_str()` implementation. Notice that
+	// `sinsp_utils::is_socktuple_valid()` ensures that path is NUL-terminated.
+	constexpr size_t MAX_UINT64_HEX_DIGITS = 16;
+	// `+ 3` accounts for `->` and a space ' ', `+ 1` accounts for trailing '\0' (see printf format
+	// below).
+	const auto name_len = MAX_UINT64_HEX_DIGITS * 2 + 3 + strlen(path) + 1;
+	std::string name(name_len, '\0');
+	const auto written_bytes =
+	        snprintf(name.data(), name.size(), "%" PRIx64 "->%" PRIx64 " %s", src, dst, path);
+	name.resize(written_bytes < 0 ? 0 : std::min<size_t>(written_bytes, name_len));
+	return name;
 }
 
 inline void sinsp_parser::fill_client_socket_info(sinsp_evt &evt,
@@ -2445,6 +2436,8 @@ inline void sinsp_parser::fill_client_socket_info(sinsp_evt &evt,
                                                   const uint8_t *exit_addr_data,
                                                   const uint8_t *enter_addr_data,
                                                   const bool can_resolve_hostname_and_port) {
+	sinsp_fdinfo *fdinfo = evt.get_fd_info_mut();
+
 	// Fill the fd with the socket info.
 	if(const uint8_t family = *exit_tuple_data; family == PPM_AF_INET || family == PPM_AF_INET6) {
 		// Always overwrite destination address and port.
@@ -2462,7 +2455,7 @@ inline void sinsp_parser::fill_client_socket_info(sinsp_evt &evt,
 			                                 dport);
 			// Check to see if it's an IPv4-mapped IPv6 address
 			// (http://en.wikipedia.org/wiki/IPv6#IPv4-mapped_IPv6_addresses)
-			auto fdi = evt.get_fd_info();
+			auto fdi = evt.get_fd_info_mut();
 			[[maybe_unused]] auto lock = fdi->write_guard();
 			if(!(sinsp_utils::is_ipv4_mapped_ipv6(sip) && sinsp_utils::is_ipv4_mapped_ipv6(dip))) {
 				fdi->m_type = SCAP_FD_IPV6_SOCK;
@@ -2493,7 +2486,7 @@ inline void sinsp_parser::fill_client_socket_info(sinsp_evt &evt,
 			                             can_resolve_hostname_and_port);
 			fdi->set_name_inner(&evt.get_paramstr_storage()[0]);
 		} else {
-			auto fdi = evt.get_fd_info();
+			auto fdi = evt.get_fd_info_mut();
 			[[maybe_unused]] auto lock = fdi->write_guard();
 			const auto *const sip = packed::in_socktuple::sip(exit_tuple_data);
 			const auto *const sport = packed::in_socktuple::sport(exit_tuple_data);
@@ -2521,7 +2514,7 @@ inline void sinsp_parser::fill_client_socket_info(sinsp_evt &evt,
 			fdi->set_name_inner(&evt.get_paramstr_storage()[0]);
 		}
 	} else {
-		auto fdi = evt.get_fd_info();
+		auto fdi = evt.get_fd_info_mut();
 		if(!fdi->is_unix_socket()) {
 			ASSERT(false);
 			return;
@@ -2537,11 +2530,11 @@ inline void sinsp_parser::fill_client_socket_info(sinsp_evt &evt,
 		memcpy(&fdi->m_sockinfo.m_unixinfo.m_fields.m_dest, raw_dest, sizeof(uint64_t));
 		const auto source = fdi->m_sockinfo.m_unixinfo.m_fields.m_source;
 		const auto dest = fdi->m_sockinfo.m_unixinfo.m_fields.m_dest;
-		fdi->set_name_inner(encode_unix_tuple_fd_name(evt, source, dest, dpath));
+		fdi->set_name_inner(encode_unix_tuple_fd_name(source, dest, dpath));
 	}
 
 	if(evt.get_fd_info()->is_role_none()) {
-		evt.get_fd_info()->set_role_client();
+		evt.get_fd_info_mut()->set_role_client();
 	}
 }
 
@@ -2554,17 +2547,17 @@ void sinsp_parser::parse_connect_exit(sinsp_evt &evt, sinsp_parser_verdict &verd
 
 	if(m_track_connection_status) {
 		if(retval == -SE_EINPROGRESS) {
-			evt.get_fd_info()->set_socket_pending();
+			evt.get_fd_info_mut()->set_socket_pending();
 		} else if(retval < 0) {
-			evt.get_fd_info()->set_socket_failed();
+			evt.get_fd_info_mut()->set_socket_failed();
 		} else {
-			evt.get_fd_info()->set_socket_connected();
+			evt.get_fd_info_mut()->set_socket_connected();
 		}
 	} else {
 		if(retval < 0 && retval != -SE_EINPROGRESS) {
 			return;
 		}
-		evt.get_fd_info()->set_socket_connected();
+		evt.get_fd_info_mut()->set_socket_connected();
 	}
 
 	// Extract enter event address parameter. This is used as a fallback in case the event tuple is
@@ -2704,7 +2697,7 @@ void sinsp_parser::parse_accept_exit(sinsp_evt &evt, sinsp_parser_verdict &verdi
 	if(m_params->m_observer) {
 		verdict.add_post_process_cbs(
 		        [fd, packed_data, fdi](sinsp_observer *observer, sinsp_evt *evt) {
-			        auto fd_info = evt->get_fd_info();
+			        auto fd_info = evt->get_fd_info_mut();
 			        if(fd_info == nullptr) {
 				        fd_info = fdi.get();
 			        }
@@ -2779,7 +2772,7 @@ void sinsp_parser::parse_close_range_exit(sinsp_evt &evt) const {
 		return;
 	}
 
-	auto *fd_table = evt.get_tinfo()->get_fd_table();
+	auto *fd_table = evt.get_tinfo()->get_fd_table_mut();
 	if(fd_table == nullptr) {
 		return;
 	}
@@ -2882,15 +2875,8 @@ void sinsp_parser::parse_thread_exit(sinsp_evt &evt, sinsp_parser_verdict &verdi
 	 */
 	verdict.set_tid_to_remove(evt.get_tid());
 
-	/* If this thread has no children we don't send the reaper info from the kernel,
-	 * so we do nothing.
-	 */
-	if(!evt.get_tinfo()->has_children()) {
-		return;
-	}
-
 	/* [Set the reaper to the current thread]
-	 * We need to set the reaper for this thread
+	 * The kernel sends one only for a thread with children, and it is read only if there are.
 	 */
 	if(evt.get_num_params() > 4) {
 		if(const auto reaper_tid_param = evt.get_param(4); !reaper_tid_param->empty()) {
@@ -3049,8 +3035,9 @@ bool sinsp_parser::update_fd(sinsp_evt &evt, const sinsp_evt_param &parinfo) con
 	}
 
 	const auto packed_data = reinterpret_cast<const uint8_t *>(parinfo.data());
+	sinsp_fdinfo *fdinfo = evt.get_fd_info_mut();
 	const auto family = *packed::generic_tuple::family(packed_data);
-	auto fdi = evt.get_fd_info();
+	auto fdi = evt.get_fd_info_mut();
 	[[maybe_unused]] auto lock = fdi->write_guard();
 
 	if(family == PPM_AF_INET) {
@@ -3112,7 +3099,7 @@ bool sinsp_parser::update_fd(sinsp_evt &evt, const sinsp_evt_param &parinfo) con
 	//
 	// If this is an incomplete tuple, patch it using interface info
 	//
-	m_params->m_network_interfaces.update_fd(*evt.get_fd_info());
+	m_params->m_network_interfaces.update_fd(*evt.get_fd_info_mut());
 
 	return true;
 }
@@ -3277,15 +3264,18 @@ void sinsp_parser::parse_read_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 		return;
 	}
 
-	auto &fdinfo = *evt.get_fd_info();
-	auto fd_type = fdinfo.get_type();
+	// The fd is looked up read-only; a private (copy-on-write) copy is detached
+	// only at the points below that actually modify the entry -- all of which are
+	// socket-only -- so a read on a shared inherited file/pipe fd leaves it
+	// shared.
+	const auto fd_type = evt.get_fd_info()->get_type();
 
 	if(evt.get_syscall_return_value() < 0) {
 		if(!m_track_connection_status) {
 			return;
 		}
 		if(fd_type == SCAP_FD_IPV4_SOCK || fd_type == SCAP_FD_IPV6_SOCK) {
-			fdinfo.set_socket_failed();
+			evt.get_fd_info_mut()->set_socket_failed();
 			// If there's a listener, add a callback to later invoke it.
 			if(!m_params->m_observer) {
 				return;
@@ -3298,7 +3288,7 @@ void sinsp_parser::parse_read_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 	}
 
 	if(fd_type == SCAP_FD_IPV4_SOCK || fd_type == SCAP_FD_IPV6_SOCK) {
-		fdinfo.set_socket_connected();
+		evt.get_fd_info_mut()->set_socket_connected();
 	}
 
 	// This should never happen: if it happens, there is a bug in the code.
@@ -3315,30 +3305,39 @@ void sinsp_parser::parse_read_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 	} else if(etype == PPME_SOCKET_RECVMMSG_X || etype == PPME_SOCKET_RECV_X) {
 		tupleparam = 4;
 	}
-	if(tupleparam != -1 && (fdinfo.get_name().length() == 0 || !fdinfo.is_tcp_socket())) {
+	// Re-fetch read-only: a socket connect above may already have detached a copy.
+	const auto *cur_fdinfo = evt.get_fd_info();
+	if(tupleparam != -1 && (cur_fdinfo->get_name().length() == 0 || !cur_fdinfo->is_tcp_socket())) {
+		// recvfrom contains tuple info. If the fd still doesn't contain tuple info (because the
+		// socket is a datagram one or because some event was lost), add it here.
 		if(update_fd(evt, *evt.get_param(tupleparam))) {
-			fd_type = fdinfo.get_type();
-			if(fd_type == SCAP_FD_IPV4_SOCK || fd_type == SCAP_FD_IPV6_SOCK) {
-				if(fdinfo.is_role_none()) {
-					fdinfo.set_net_role_by_guessing(*evt.get_tinfo(), true);
+			// update_fd() detached a private writable copy and may have changed the event's fd
+			// type; finish the update on it. This is the first point on a plain (non-socket)
+			// read where a shared inherited entry would be detached, and it is gated on socket
+			// tuple params, so file/pipe reads leave the entry shared.
+			auto *wfdinfo = evt.get_fd_info_mut();
+			const auto new_fd_type = wfdinfo->get_type();
+			if(new_fd_type == SCAP_FD_IPV4_SOCK || new_fd_type == SCAP_FD_IPV6_SOCK) {
+				if(wfdinfo->is_role_none()) {
+					wfdinfo->set_net_role_by_guessing(*evt.get_tinfo(), true);
 				}
 
-				if(fdinfo.is_role_client()) {
-					swap_addresses(fdinfo);
+				if(wfdinfo->is_role_client()) {
+					swap_addresses(*wfdinfo);
 				}
 
 				auto *const str_storage_ptr = &evt.get_paramstr_storage()[0];
 				const auto str_storage_len = std::size(evt.get_paramstr_storage());
-				auto si = fdinfo.get_sockinfo();
+				auto si = wfdinfo->get_sockinfo();
 				sinsp_utils::sockinfo_to_str(&si,
-				                             fd_type,
+				                             new_fd_type,
 				                             str_storage_ptr,
 				                             str_storage_len,
 				                             m_params->m_hostname_and_port_resolution_enabled);
-				fdinfo.set_name(str_storage_ptr);
+				wfdinfo->set_name(str_storage_ptr);
 			} else {
 				const char *parstr;
-				fdinfo.set_name(evt.get_param_as_str(tupleparam, &parstr, sinsp_evt::PF_SIMPLE));
+				wfdinfo->set_name(evt.get_param_as_str(tupleparam, &parstr, sinsp_evt::PF_SIMPLE));
 			}
 		}
 	}
@@ -3361,6 +3360,8 @@ void sinsp_parser::parse_read_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 		verdict.add_post_process_cbs([data_ptr, data_len, lastevent_fd](sinsp_observer *observer,
 		                                                                sinsp_evt *evt) {
 			const auto original_len = static_cast<uint32_t>(evt->get_syscall_return_value());
+			// The observer gets a read-only handle; a listener that needs to
+			// modify the entry re-fetches a writable copy-on-write copy itself.
 			observer->on_read(evt,
 			                  evt->get_tid(),
 			                  lastevent_fd,
@@ -3374,8 +3375,8 @@ void sinsp_parser::parse_read_exit(sinsp_evt &evt, sinsp_parser_verdict &verdict
 #ifndef _WIN32
 	// For unix sockets, check if recvmsg contains ancillary data. If so, we check for SCM_RIGHTS,
 	// which is used to pass FDs between processes, and update the sinsp state accordingly via
-	// procfs scan.
-	if(fdinfo.is_unix_socket()) {
+	// procfs scan. Re-fetch read-only: the tuple update above may have detached a copy.
+	if(evt.get_fd_info()->is_unix_socket()) {
 		int32_t msgctrl_param_id = -1;
 		if(etype == PPME_SOCKET_RECVMSG_X && evt.get_num_params() >= 5) {
 			msgctrl_param_id = 4;
@@ -3411,15 +3412,19 @@ void sinsp_parser::parse_write_exit(sinsp_evt &evt, sinsp_parser_verdict &verdic
 		return;
 	}
 
-	auto &fdinfo = *evt.get_fd_info();
-	auto fd_type = fdinfo.get_type();
+	// The fd is looked up read-only; a private (copy-on-write) copy is detached
+	// only at the points below that actually modify the entry -- all of which are
+	// socket-only -- so a write on a shared inherited file/pipe fd leaves it
+	// shared.
+	const auto fd_type = evt.get_fd_info()->get_type();
 
 	if(evt.get_syscall_return_value() < 0) {
 		if(!m_track_connection_status) {
 			return;
 		}
 		if(fd_type == SCAP_FD_IPV4_SOCK || fd_type == SCAP_FD_IPV6_SOCK) {
-			fdinfo.set_socket_failed();
+			evt.get_fd_info_mut()->set_socket_failed();
+			// If there's a listener, add a callback to later invoke it.
 			if(!m_params->m_observer) {
 				return;
 			}
@@ -3431,7 +3436,7 @@ void sinsp_parser::parse_write_exit(sinsp_evt &evt, sinsp_parser_verdict &verdic
 	}
 
 	if(fd_type == SCAP_FD_IPV4_SOCK || fd_type == SCAP_FD_IPV6_SOCK) {
-		fdinfo.set_socket_connected();
+		evt.get_fd_info_mut()->set_socket_connected();
 	}
 
 	// This should never happen: if it happens, there is a bug in the code.
@@ -3440,37 +3445,44 @@ void sinsp_parser::parse_write_exit(sinsp_evt &evt, sinsp_parser_verdict &verdic
 		return;
 	}
 
+	// Re-fetch read-only: a socket connect above may already have detached a copy.
+	const auto *cur_fdinfo = evt.get_fd_info();
 	if((etype == PPME_SOCKET_SEND_X || etype == PPME_SOCKET_SENDTO_X ||
 	    etype == PPME_SOCKET_SENDMSG_X || etype == PPME_SOCKET_SENDMMSG_X) &&
-	   (fdinfo.get_name().empty() || !fdinfo.is_tcp_socket())) {
+	   (cur_fdinfo->get_name().empty() || !cur_fdinfo->is_tcp_socket())) {
 		// send, sendto, sendmsg and sendmmsg contain tuple info in the exit event. If the fd
 		// still doesn't contain tuple info (because the socket is a datagram one or because
 		// some event was lost), add it here.
 		if(constexpr uint32_t SOCKET_TUPLE_PARAM_ID = 4;
 		   update_fd(evt, *evt.get_param(SOCKET_TUPLE_PARAM_ID))) {
-			fd_type = fdinfo.get_type();
-			if(fd_type == SCAP_FD_IPV4_SOCK || fd_type == SCAP_FD_IPV6_SOCK) {
-				if(fdinfo.is_role_none()) {
-					fdinfo.set_net_role_by_guessing(*evt.get_tinfo(), false);
+			// update_fd() detached a private writable copy and may have changed the event's fd
+			// type; finish the update on it. This is the first point on a plain (non-socket)
+			// write where a shared inherited entry would be detached, and it is gated on socket
+			// send params, so file/pipe writes leave the entry shared.
+			auto *wfdinfo = evt.get_fd_info_mut();
+			const auto new_fd_type = wfdinfo->get_type();
+			if(new_fd_type == SCAP_FD_IPV4_SOCK || new_fd_type == SCAP_FD_IPV6_SOCK) {
+				if(wfdinfo->is_role_none()) {
+					wfdinfo->set_net_role_by_guessing(*evt.get_tinfo(), false);
 				}
 
-				if(fdinfo.is_role_server()) {
-					swap_addresses(*evt.get_fd_info());
+				if(wfdinfo->is_role_server()) {
+					swap_addresses(*wfdinfo);
 				}
 
 				auto *const str_storage_ptr = &evt.get_paramstr_storage()[0];
 				const auto str_storage_len = std::size(evt.get_paramstr_storage());
-				auto si = fdinfo.get_sockinfo();
+				auto si = wfdinfo->get_sockinfo();
 				sinsp_utils::sockinfo_to_str(&si,
-				                             fd_type,
+				                             new_fd_type,
 				                             str_storage_ptr,
 				                             str_storage_len,
 				                             m_params->m_hostname_and_port_resolution_enabled);
 
-				fdinfo.set_name(str_storage_ptr);
+				wfdinfo->set_name(str_storage_ptr);
 			} else {
 				const char *parstr;
-				fdinfo.set_name(
+				wfdinfo->set_name(
 				        evt.get_param_as_str(SOCKET_TUPLE_PARAM_ID, &parstr, sinsp_evt::PF_SIMPLE));
 			}
 		}
@@ -3492,6 +3504,8 @@ void sinsp_parser::parse_write_exit(sinsp_evt &evt, sinsp_parser_verdict &verdic
 		verdict.add_post_process_cbs([data_ptr, data_len, lastevent_fd](sinsp_observer *observer,
 		                                                                sinsp_evt *evt) {
 			const auto original_len = static_cast<uint32_t>(evt->get_syscall_return_value());
+			// The observer gets a read-only handle; a listener that needs to
+			// modify the entry re-fetches a writable copy-on-write copy itself.
 			observer->on_write(evt,
 			                   evt->get_tid(),
 			                   lastevent_fd,
@@ -3782,10 +3796,10 @@ void sinsp_parser::parse_fcntl_exit(sinsp_evt &evt) {
 
 #ifdef FD_CLOEXEC
 	if(cmd == PPM_FCNTL_F_SETFD) {
-		evt.get_fd_info()->clear_close_on_exec_bits();
+		evt.get_fd_info_mut()->clear_close_on_exec_bits();
 		const auto arg = evt.get_param(3)->as<uint64_t>();
 		if((arg & FD_CLOEXEC) != 0) {
-			evt.get_fd_info()->m_openflags |= PPM_O_CLOEXEC;
+			evt.get_fd_info_mut()->m_openflags |= PPM_O_CLOEXEC;
 		}
 		return;
 	}
@@ -3816,11 +3830,10 @@ void sinsp_parser::parse_context_switch(sinsp_evt &evt) {
 
 	evt.get_tinfo()->set_pfmajor(evt.get_param(1)->as<uint64_t>());
 	evt.get_tinfo()->set_pfminor(evt.get_param(2)->as<uint64_t>());
-	if(const auto main_tinfo = evt.get_tinfo()->get_main_thread()) {
-		main_tinfo->set_vmsize_kb(evt.get_param(3)->as<uint32_t>());
-		main_tinfo->set_vmrss_kb(evt.get_param(4)->as<uint32_t>());
-		main_tinfo->set_vmswap_kb(vm_swap_param->as<uint32_t>());
-	}
+	const auto process_tinfo = evt.get_tinfo()->get_main_thread_or_self();
+	process_tinfo->set_vmsize_kb(evt.get_param(3)->as<uint32_t>());
+	process_tinfo->set_vmrss_kb(evt.get_param(4)->as<uint32_t>());
+	process_tinfo->set_vmswap_kb(vm_swap_param->as<uint32_t>());
 }
 
 void sinsp_parser::parse_brk_mmap_mmap2_munmap__exit(sinsp_evt &evt) {
@@ -3828,16 +3841,18 @@ void sinsp_parser::parse_brk_mmap_mmap2_munmap__exit(sinsp_evt &evt) {
 		return;
 	}
 
+	// The memory footprint is the process's, and the main thread keeps it
+	const auto process_tinfo = evt.get_tinfo()->get_main_thread_or_self();
 	if(const auto vm_size_param = evt.get_param(1); !vm_size_param->empty()) {
-		evt.get_tinfo()->set_vmsize_kb(vm_size_param->as<uint32_t>());
+		process_tinfo->set_vmsize_kb(vm_size_param->as<uint32_t>());
 	}
 	// If one of these parameters is present, so is for the other ones, so just check
 	// the presence of one of them.
 	const auto vm_rss_param = evt.get_param(2);
 	const auto vm_swap_param = evt.get_param(3);
 	if(!vm_swap_param->empty()) {
-		evt.get_tinfo()->set_vmrss_kb(vm_rss_param->as<uint32_t>());
-		evt.get_tinfo()->set_vmswap_kb(vm_swap_param->as<uint32_t>());
+		process_tinfo->set_vmrss_kb(vm_rss_param->as<uint32_t>());
+		process_tinfo->set_vmswap_kb(vm_swap_param->as<uint32_t>());
 	}
 }
 
@@ -3985,6 +4000,22 @@ void sinsp_parser::parse_prctl_exit(sinsp_evt &evt) {
 	caller_tinfo->get_tginfo()->set_reaper(child_subreaper);
 }
 
+// Apply `update` to every thread of the process of `tinfo`. The kernel keeps some state once per
+// process, but sinsp keeps a copy of it on each thread, and the readers read the event's thread.
+template<typename F>
+static void for_each_thread_of_process(sinsp_threadinfo &tinfo, F update) {
+	const auto tginfo = tinfo.get_tginfo();
+	if(tginfo == nullptr) {
+		update(tinfo);
+		return;
+	}
+	for(const auto &thread_weak : tginfo->get_thread_list()) {
+		if(const auto thread = thread_weak.lock()) {
+			update(*thread);
+		}
+	}
+}
+
 void sinsp_parser::parse_chroot_exit(sinsp_evt &evt) {
 	if(evt.get_tinfo() == nullptr || evt.get_syscall_return_value() != 0) {
 		return;
@@ -3992,17 +4023,17 @@ void sinsp_parser::parse_chroot_exit(sinsp_evt &evt) {
 
 	const char *resolved_path;
 	const auto path = evt.get_param_as_str(1, &resolved_path);
-	if(resolved_path[0] == 0) {
-		evt.get_tinfo()->set_root(path);
-	} else {
-		evt.get_tinfo()->set_root(resolved_path);
-	}
+	const std::string root = resolved_path[0] == 0 ? path : resolved_path;
+	// The root directory is in the fs_struct, which the threads of a process share
+	for_each_thread_of_process(*evt.get_tinfo(), [&](sinsp_threadinfo &t) { t.set_root(root); });
 }
 
 void sinsp_parser::parse_setsid_exit(sinsp_evt &evt) {
 	if(const auto retval = evt.get_syscall_return_value();
 	   retval >= 0 && evt.get_thread_info() != nullptr) {
-		evt.get_thread_info()->set_sid(retval);
+		// The session is in the signal_struct of the process
+		for_each_thread_of_process(*evt.get_thread_info(),
+		                           [retval](sinsp_threadinfo &t) { t.set_sid(retval); });
 	}
 }
 
@@ -4026,9 +4057,9 @@ void sinsp_parser::parse_getsockopt_exit(sinsp_evt &evt, sinsp_parser_verdict &v
 
 	evt.set_errorcode(static_cast<int32_t>(err));
 	if(err < 0) {
-		evt.get_fd_info()->set_socket_failed();
+		evt.get_fd_info_mut()->set_socket_failed();
 	} else {
-		evt.get_fd_info()->set_socket_connected();
+		evt.get_fd_info_mut()->set_socket_connected();
 	}
 
 	// If there's a listener, add a callback to later invoke it.

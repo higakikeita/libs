@@ -67,11 +67,9 @@ if(NOT WIN32)
 endif()
 
 option(SCAP_FILES_SUITE_ENABLE "Enable scap-file tests in sinsp" "ON")
-# Scap-files on Big Endian systems are not supported
-if((NOT ${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "s390x")
-   AND ${SCAP_FILES_SUITE_ENABLE}
-   AND TARGET unit-test-libsinsp
-)
+# Scap-files on Big Endian systems are not supported. Detect endianness directly instead of matching
+# s390x, so other big-endian targets (e.g. big-endian PowerPC) are covered too.
+if((NOT CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN") AND ${SCAP_FILES_SUITE_ENABLE})
 	# Binary dir in which we will save all our scap files
 	file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/scap_files")
 	# Add here the name for new scap-files
@@ -110,6 +108,8 @@ set(LIBSINSP_UNIT_TESTS_SOURCES
 	filter_eval_test.cpp
 	events_evt.ut.cpp
 	events_file.ut.cpp
+	fdinfo_content_equals.ut.cpp
+	fdtable_sharing.ut.cpp
 	events_fspath.ut.cpp
 	events_injection.ut.cpp
 	events_net.ut.cpp
@@ -124,16 +124,18 @@ set(LIBSINSP_UNIT_TESTS_SOURCES
 	plugins.ut.cpp
 	plugin_manager.ut.cpp
 	prefix_search.ut.cpp
+	raw_block.ut.cpp
 	string_visitor.ut.cpp
 	filtercheck_has_args.ut.cpp
 	filter_fields_info.ut.cpp
 	filter_escaping.ut.cpp
 	filter_parser.ut.cpp
-	filter_op_bcontains.ut.cpp
+	filter_op_bytebuf.ut.cpp
 	filter_op_contains.ut.cpp
 	filter_op_pmatch.ut.cpp
 	filter_op_net_compare.ut.cpp
 	filter_op_numeric_compare.ut.cpp
+	filter_compare_resolved.ut.cpp
 	filter_compiler.ut.cpp
 	filter_transformer.ut.cpp
 	user.ut.cpp

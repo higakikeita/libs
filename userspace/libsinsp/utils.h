@@ -112,11 +112,10 @@ public:
 	static bool unhex(std::string_view hex_chars, std::vector<char>& hex_bytes);
 
 	//
-	// Concatenate posix-style path1 and path2 up to max_len in size, normalizing the result.
-	// path1 MUST be '/' terminated and is not sanitized.
-	// If path2 is absolute, the result will be equivalent to path2.
-	// If the result would be too long, the output will contain the string
-	// "/DIR_TOO_LONG/FILENAME_TOO_LONG" instead.
+	// Concatenate posix-style path1 and path2 up to `SCAP_MAX_PATH_SIZE` in size, normalizing the
+	// result. `path1` MUST be '/' terminated and is not normalized. If `path2` is absolute, the
+	// result will be equivalent to `path2`. If the result would be too long, the output will
+	// contain the string "/DIR_TOO_LONG/FILENAME_TOO_LONG" instead.
 	//
 	static std::string concatenate_paths(std::string_view path1, std::string_view path2);
 
@@ -174,11 +173,24 @@ public:
 // little STL thing to sanitize strings
 ///////////////////////////////////////////////////////////////////////////////
 
+namespace utf8 {
+[[nodiscard]] inline int seq_len(const unsigned char* p, const unsigned char* p_end);
+[[nodiscard]] inline const unsigned char* skip_8_byte_ascii_blocks(const unsigned char* ptr,
+                                                                   const unsigned char* end_ptr);
+[[nodiscard]] inline const unsigned char* first_invalid_seq(const unsigned char* ptr,
+                                                            const unsigned char* end_ptr);
+inline void append_sanitized(std::string& storage, std::string_view str, size_t valid_prefix_len);
+[[nodiscard]] inline std::string_view sanitize(std::string_view str, std::string& storage);
+[[nodiscard]] inline std::string_view sanitize_with_lazy_storage(
+        std::string_view str,
+        std::unique_ptr<std::string>& storage);
+}  // namespace utf8
+
 // Returns a nonzero integer describing the UTF-8 sequence starting at `p`:
-// - if > 0, indicates a valid and printable UTF-8 sequence; the returned value is the sequence
-//   length (in range [1; 4]).
-// - if < 0, indicates an invalid byte, a broken sequence, or a valid-but-non-printable sequence;
-//   the absolute value is the number of bytes to consume (in range [1; 4]).
+// - if > 0, indicates a valid UTF-8 sequence; the returned value is the sequence length (in range
+//   [1; 4]).
+// - if < 0, indicates an invalid byte or a broken sequence; the absolute value is the number of
+//   bytes to consume (in range [1; 4]).
 //
 // Broken sequences follow the maximal subpart substitution algorithm (Unicode Standard §3.9, U+FFFD
 // Substitution of Maximal Subparts): each continuation byte that falls within the valid range for
@@ -188,14 +200,12 @@ public:
 //   return value: -2
 // - sequence: 3-byte lead + bad first continuation; consumed 1 byte; return value: -1
 //
-// Valid-but-non-printable sequences (C1 controls U+0080..U+009F, Unicode non-characters) are
-// consumed in full (e.g. -2 for U+0085 = C2 85, -3 for U+FDD0 = EF B7 90).
 // `p_end` is the exclusive upper bound of the source buffer.
-inline int utf8_seq_len(const unsigned char* p, const unsigned char* p_end) {
+[[nodiscard]] inline int utf8::seq_len(const unsigned char* p, const unsigned char* p_end) {
 	const unsigned char c = p[0];
 	if(c < 0x80) {
-		// ASCII: printable range is 0x20 (space) to 0x7E (tilde); reject control chars and DEL.
-		return c >= 0x20 && c != 0x7F ? 1 : -1;
+		// ASCII: every byte < 0x80 is a valid single-byte sequence (control chars included).
+		return 1;
 	}
 	if(c < 0xC2) {
 		// 0x80-0xBF: orphan continuation byte.
@@ -203,14 +213,11 @@ inline int utf8_seq_len(const unsigned char* p, const unsigned char* p_end) {
 		return -1;
 	}
 	if(c < 0xE0) {
-		// 2-byte: 110xxxxx 10xxxxxx. Need 1 continuation byte.
+		// 2-byte: 110xxxxx 10xxxxxx. Need 1 continuation byte; overlongs excluded by c >= 0xC2.
 		if(p + 1 >= p_end || (p[1] & 0xC0) != 0x80) {
 			return -1;
 		}
-		const unsigned int cp =
-		        static_cast<unsigned int>(c & 0x1F) << 6 | static_cast<unsigned int>(p[1] & 0x3F);
-		// Reject C1 control characters (U+0080..U+009F) (non-printable).
-		return cp > 0x9F ? 2 : -2;
+		return 2;
 	}
 	if(c < 0xF0) {
 		// 3-byte: 1110xxxx 10xxxxxx 10xxxxxx.
@@ -227,14 +234,8 @@ inline int utf8_seq_len(const unsigned char* p, const unsigned char* p_end) {
 		if(p + 2 >= p_end || (p[2] & 0xC0) != 0x80) {
 			return -2;  // Maximal subpart: lead + first continuation.
 		}
-		const unsigned int cp = static_cast<unsigned int>(c & 0x0F) << 12 |
-		                        static_cast<unsigned int>(p[1] & 0x3F) << 6 |
-		                        static_cast<unsigned int>(p[2] & 0x3F);
-		// Overlongs and surrogates are structurally excluded by the narrow ranges above.
-		// Reject Unicode non-characters (U+FDD0-U+FDEF, U+FFFE-U+FFFF).
-		if((cp >= 0xFDD0 && cp <= 0xFDEF) || cp >= 0xFFFE) {
-			return -3;
-		}
+		// Overlongs and surrogates are structurally excluded by the narrow ranges above;
+		// any remaining code point (non-characters included) is valid.
 		return 3;
 	}
 	if(c <= 0xF4) {
@@ -254,15 +255,8 @@ inline int utf8_seq_len(const unsigned char* p, const unsigned char* p_end) {
 		if(p + 3 >= p_end || (p[3] & 0xC0) != 0x80) {
 			return -3;  // Maximal subpart: lead + first + second continuation.
 		}
-		const unsigned int cp = static_cast<unsigned int>(c & 0x07) << 18 |
-		                        static_cast<unsigned int>(p[1] & 0x3F) << 12 |
-		                        static_cast<unsigned int>(p[2] & 0x3F) << 6 |
-		                        static_cast<unsigned int>(p[3] & 0x3F);
-		// Overlongs and out-of-range values are structurally excluded by the narrow ranges above.
-		// Reject end-of-plane non-characters (U+xFFFE, U+xFFFF for planes 1-16).
-		if((cp & 0xFFFF) >= 0xFFFE) {
-			return -4;
-		}
+		// Overlongs and out-of-range values are structurally excluded by the narrow ranges above;
+		// any remaining code point (non-characters included) is valid.
 		return 4;
 	}
 
@@ -270,26 +264,18 @@ inline int utf8_seq_len(const unsigned char* p, const unsigned char* p_end) {
 	return -1;
 }
 
-// Skips 8 printable ASCII bytes [0x20, 0x7E] at a time, until it finds a block of 8 bytes
-// containing a single byte not in that range or until it finds a block (at the end of the string)
-// shorter than 8 bytes. Returns the pointer to the next invalid block or to the final shorter
-// block.
-inline const unsigned char* skip_8_byte_printable_ascii_blocks(const unsigned char* ptr,
-                                                               const unsigned char* end_ptr) {
+// Skips 8 ASCII bytes at a time, until it finds a block of 8 bytes containing a single byte that is
+// not ASCII, or until it finds a block (at the end of the string) shorter than 8 bytes. Returns the
+// pointer to the next non-ASCII block or to the final shorter block.
+[[nodiscard]] inline const unsigned char* utf8::skip_8_byte_ascii_blocks(
+        const unsigned char* ptr,
+        const unsigned char* end_ptr) {
 	while(ptr + 8 <= end_ptr) {
 		uint64_t word;
 		memcpy(&word, ptr, 8);
-		// Check all 8 bytes are printable ASCII [0x20, 0x7E] using word-at-a-time tricks.
-		// Each condition isolates the highest bit of each byte (by masking it with 0x80).
-		// Check 1: match any byte >= 0x80 (non-ASCII, having high bit == 1)
-		// Check 2: adding 0x60 maps [0x00,0x1F] to [0x60,0x7F] (high bit == 0) and [0x20,0x7F] to
-		//   [0x80,0xDF] (high bit == 1); no carry between bytes since all bytes are <= 0x7F after
-		//   check 1, so max per-byte result is 0x7F+0x60=0xDF < 0x100; match any byte of the first
-		//   group (high bit 0)
-		// Check 3: match any byte == 0x7F (DEL): adding 0x01 maps 0x7F to 0x80 (high bit == 1)
-		if(word & 0x8080808080808080ULL ||
-		   ((word + 0x6060606060606060ULL) & 0x8080808080808080ULL) != 0x8080808080808080ULL ||
-		   (word + 0x0101010101010101ULL) & 0x8080808080808080ULL) {
+		// A byte is valid ASCII if the highest bit is not set. Use an 8-byte mask to check 8 bytes
+		// in a single shot.
+		if(word & 0x8080808080808080ULL) {
 			break;
 		}
 		ptr += 8;
@@ -298,22 +284,21 @@ inline const unsigned char* skip_8_byte_printable_ascii_blocks(const unsigned ch
 }
 
 // Returns a pointer to the first invalid UTF-8 sequence of bytes between `ptr` and `end_ptr`. In
-// this context, an invalid sequence is an invalid byte, a broken sequence (e.g.: wrong continuation
-// byte) or a valid-but-non-printable sequence. If the input is a valid printable UTF-8 string, it
-// returns `end_ptr`; otherwise, the returned pointer is guaranteed to be in the range [ptr;
-// end_ptr).
-inline const unsigned char* utf8_first_invalid_seq(const unsigned char* ptr,
-                                                   const unsigned char* end_ptr) {
+// this context, an invalid sequence is an invalid byte or a broken sequence (e.g.: wrong
+// continuation byte). If the input is a valid UTF-8 string, it returns `end_ptr`; otherwise, the
+// returned pointer is guaranteed to be in the range [ptr; end_ptr).
+inline const unsigned char* utf8::first_invalid_seq(const unsigned char* ptr,
+                                                    const unsigned char* end_ptr) {
 	while(ptr < end_ptr) {
-		// If `ptr` is 8-byte aligned, try to fast-skip 8-byte printable ASCII blocks.
+		// If `ptr` is 8-byte aligned, try to fast-skip 8-byte ASCII blocks.
 		if((reinterpret_cast<uintptr_t>(ptr) & 7u) == 0u) {
-			ptr = skip_8_byte_printable_ascii_blocks(ptr, end_ptr);
+			ptr = utf8::skip_8_byte_ascii_blocks(ptr, end_ptr);
 			if(ptr >= end_ptr) {
 				return end_ptr;
 			}
 		}
 		// Check if the next sequence is invalid (i.e.: `seq_len` is negative).
-		const int seq_len = utf8_seq_len(ptr, end_ptr);
+		const int seq_len = utf8::seq_len(ptr, end_ptr);
 		if(seq_len < 0) {
 			return ptr;
 		}
@@ -325,9 +310,9 @@ inline const unsigned char* utf8_first_invalid_seq(const unsigned char* ptr,
 // Appends a sanitized version of `str` to `storage`. `valid_prefix_len` is the length of the prefix
 // in `str` that is assumed to be valid and copied as is. `valid_prefix_len` must be less than
 // str.size()`, and `storage` and `str` must not alias the same memory region.
-inline void append_sanitized_string(std::string& storage,
-                                    std::string_view str,
-                                    const size_t valid_prefix_len) {
+inline void utf8::append_sanitized(std::string& storage,
+                                   const std::string_view str,
+                                   const size_t valid_prefix_len) {
 	ASSERT(valid_prefix_len < str.size());
 	// Assert `storage` and `str` don't alias the same memory region.
 	ASSERT(reinterpret_cast<uintptr_t>(str.data()) + str.size() <=
@@ -350,7 +335,7 @@ inline void append_sanitized_string(std::string& storage,
 	do {
 		// Process the current sequence first (on the first iteration this is the one that must be
 		// replaced).
-		if(const int seq_len = utf8_seq_len(str_scan_ptr, str_end_ptr); seq_len > 0) {
+		if(const int seq_len = utf8::seq_len(str_scan_ptr, str_end_ptr); seq_len > 0) {
 			str_scan_ptr += seq_len;
 		} else {
 			// Found invalid sequence. Copy the last valid block (if any) and then append the
@@ -363,9 +348,9 @@ inline void append_sanitized_string(std::string& storage,
 			str_scan_ptr += -seq_len;
 			block_start = str_scan_ptr;
 		}
-		// If `str_scan_ptr` is now 8-byte aligned, try to fast-skip 8-byte printable ASCII blocks.
+		// If `str_scan_ptr` is now 8-byte aligned, try to fast-skip 8-byte ASCII blocks.
 		if((reinterpret_cast<uintptr_t>(str_scan_ptr) & 7u) == 0u) {
-			str_scan_ptr = skip_8_byte_printable_ascii_blocks(str_scan_ptr, str_end_ptr);
+			str_scan_ptr = utf8::skip_8_byte_ascii_blocks(str_scan_ptr, str_end_ptr);
 		}
 	} while(str_scan_ptr < str_end_ptr);
 
@@ -376,12 +361,14 @@ inline void append_sanitized_string(std::string& storage,
 	}
 }
 
-// Sanitizes `str`, returning a string view of its sanitized version. It returns:
-// - `str` itself, if already sanitized
-// - a string view of `storage`, if `str` needs sanitization. In this case a sanitized version of
-// `str` is written into `storage`, reusing its capacity.
+// Replaces invalid UTF-8 sequences in `str` with `U+FFFD`, returning a view of the result. It
+// returns:
+// - `str` itself, if it contains no invalid UTF-8 sequence
+// - a view of `storage`, if `str` contains invalid sequences. In this case the replaced version of
+//   `str` is written into `storage`, reusing its capacity.
 // `storage` and `str` must not alias the same memory region.
-[[nodiscard]] inline std::string_view sanitize_string(std::string_view str, std::string& storage) {
+[[nodiscard]] inline std::string_view utf8::sanitize(const std::string_view str,
+                                                     std::string& storage) {
 	// Assert `storage` and `str` don't alias the same memory region.
 	ASSERT(reinterpret_cast<uintptr_t>(str.data()) + str.size() <=
 	               reinterpret_cast<uintptr_t>(storage.data()) ||
@@ -394,7 +381,7 @@ inline void append_sanitized_string(std::string& storage,
 	// First pass (note: this must be FAST).
 	// Find the first sequence needing replacement. For valid strings, this is the only pass that
 	// runs (no replacement needed), and the flow immediately returns after it.
-	const auto* const first_invalid_ptr = utf8_first_invalid_seq(ptr, end_ptr);
+	const auto* const first_invalid_ptr = utf8::first_invalid_seq(ptr, end_ptr);
 	if(first_invalid_ptr == end_ptr) {
 		return str;  // CLion false positive: no address escapes here.
 	}
@@ -404,8 +391,49 @@ inline void append_sanitized_string(std::string& storage,
 	storage.clear();  // Reset to empty while preserving allocated capacity.
 	storage.reserve(str.size());
 	const auto valid_prefix_len = static_cast<size_t>(first_invalid_ptr - ptr);
-	append_sanitized_string(storage, str, valid_prefix_len);
+	utf8::append_sanitized(storage, str, valid_prefix_len);
 	return storage;
+}
+
+// Replaces invalid UTF-8 sequences in `str` with `U+FFFD`, returning a view of the result. It
+// returns:
+// - `str` itself, if it contains no invalid UTF-8 sequence
+// - a view of `*storage`, if `str` contains invalid sequences. In this case the replaced version of
+//   `str` is written into `*storage`, reusing its capacity. If `storage` hasn't been allocated yet,
+//   it is allocated internally.
+// `*storage` and `str` must not alias the same memory region.
+[[nodiscard]] inline std::string_view utf8::sanitize_with_lazy_storage(
+        const std::string_view str,
+        std::unique_ptr<std::string>& storage) {
+	// If `storage` points to any allocated storage, assert `*storage` and `str` don't alias the
+	// same memory region.
+	ASSERT(!storage ||
+	       reinterpret_cast<uintptr_t>(str.data()) + str.size() <=
+	               reinterpret_cast<uintptr_t>(storage->data()) ||
+	       reinterpret_cast<uintptr_t>(storage->data()) + storage->capacity() <=
+	               reinterpret_cast<uintptr_t>(str.data()));
+
+	const auto* const ptr = reinterpret_cast<const unsigned char*>(str.data());
+	const auto* const end_ptr = ptr + str.size();
+
+	// First pass (note: this must be FAST).
+	// Find the first sequence needing replacement. For valid strings, this is the only pass that
+	// runs (no replacement needed), and the flow immediately returns after it.
+	const auto* const first_invalid_ptr = utf8::first_invalid_seq(ptr, end_ptr);
+	if(first_invalid_ptr == end_ptr) {
+		return str;  // CLion false positive: no address escapes here.
+	}
+
+	// Second pass for strings needing replacements. Unfortunately, this is not as fast as the first
+	// pass.
+	if(!storage) {
+		storage = std::make_unique<std::string>();
+	}
+	const auto valid_prefix_len = static_cast<size_t>(first_invalid_ptr - ptr);
+	storage->clear();  // Reset to empty while preserving allocated capacity.
+	storage->reserve(str.size());
+	utf8::append_sanitized(*storage, str, valid_prefix_len);
+	return std::string_view{storage->data(), storage->size()};
 }
 
 inline void remove_duplicate_path_separators(std::string& str) {

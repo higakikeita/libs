@@ -37,6 +37,26 @@ include(jsoncpp)
 include(zlib)
 include(tbb)
 
+# The compile-time version macros only carry major.minor.patch, so drop anything the git-derived
+# version appends to them.
+string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)" _sinsp_version "${FALCOSECURITY_LIBS_VERSION}")
+
+if(_sinsp_version)
+	set(SINSP_VERSION_MAJOR ${CMAKE_MATCH_1})
+	set(SINSP_VERSION_MINOR ${CMAKE_MATCH_2})
+	set(SINSP_VERSION_PATCH ${CMAKE_MATCH_3})
+else()
+	# Same fallback get_shared_libs_versions() uses for an unparseable version.
+	set(SINSP_VERSION_MAJOR 0)
+	set(SINSP_VERSION_MINOR 0)
+	set(SINSP_VERSION_PATCH 0)
+endif()
+
+configure_file(
+	${CMAKE_CURRENT_SOURCE_DIR}/sinsp_config.h.in
+	${CMAKE_CURRENT_BINARY_DIR}/libsinsp/sinsp_config.h @ONLY
+)
+
 add_library(
 	sinsp
 	filter/ast.cpp
@@ -99,12 +119,6 @@ add_library(
 	state/table.cpp
 )
 
-# On non-glibc platforms (e.g. musl), fgetpwent_r/fgetgrent_r are not available. Provide
-# from-scratch implementations.
-if(MUSL_OPTIMIZED_BUILD)
-	target_sources(sinsp PRIVATE fgetpwent_r.cpp)
-endif()
-
 if(NOT WIN32
    AND NOT APPLE
    AND NOT EMSCRIPTEN
@@ -123,6 +137,7 @@ endif()
 target_include_directories(
 	sinsp
 	PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}> $<BUILD_INTERFACE:${LIBS_DIR}/userspace>
+		   $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
 		   $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/include/${LIBS_PACKAGE_NAME}>
 )
 

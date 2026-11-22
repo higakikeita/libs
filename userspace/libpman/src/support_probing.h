@@ -23,11 +23,21 @@ limitations under the License.
 #ifdef BPF_ITERATOR_SUPPORT
 
 #include <bpf_probe.skel.h>
+#include "state.h"
 
-// Main function for support probing. Use this to probe if a specific BPF iterator program can be
-// safely loaded on the current machine. Return 0 if the current machine supports the program, a
-// negative number otherwise.
+// Main function for program support probing. Use this to probe if a specific BPF iterator program
+// can be safely loaded on the current machine. Return 0 if the current machine supports the
+// program, a negative number otherwise.
 int iter_support_probing__probe(const char *prog_name);
+
+// Probe whether the support for `bpf_iter_link_info` or any of its members is available. Store the
+// findings in the provided object.
+void iter_support_probing__probe_bpf_iter_link_info_support(
+        struct bpf_iter_link_info_support_info *info);
+
+// Probe whether the calling process runs in the root PID namespace. Return true if in the root PID
+// namespace, false otherwise (including when it cannot be determined).
+bool iter_support_probing__is_in_root_pid_namespace(void);
 
 // The following declarations are here just to avoid creating a separate header file. They are
 // called by `iter_support_probing__probe()`. Don't use them directly.

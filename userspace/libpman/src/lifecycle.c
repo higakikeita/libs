@@ -56,6 +56,20 @@ static bool is_kernel_symbol_available(const char *symbol) {
 
 #ifdef BPF_ITERATOR_SUPPORT
 static void prepare_iter_progs_before_loading() {
+	// Disable autoloading for all iterator programs if iterators support is disabled.
+	if(g_state.iterators_disabled) {
+		for(int i = 0; i < ITER_PROG_MAX; i++) {
+			const iter_prog_t *iter_prog = &iter_progs_table[i];
+			const char *prog_name = iter_prog->name;
+			log_msgf(FALCOSECURITY_LOG_SEV_DEBUG,
+			         "disabled BPF program '%s' (due to disabled BPF iterators support)",
+			         prog_name);
+			disable_prog_autoloading(prog_name);
+			*iter_prog->feature_flag = false;
+		}
+		return;
+	}
+
 	// Disable autoloading for unsupported iterator programs.
 	for(int i = 0; i < ITER_PROG_MAX; i++) {
 		const iter_prog_t *iter_prog = &iter_progs_table[i];
@@ -74,6 +88,21 @@ static void prepare_iter_progs_before_loading() {
 }
 #endif
 
+/* Whether this kernel provides everything a program declares it needs. */
+static bool prog_requirements_met(const event_prog_t *prog) {
+	if(prog->feat > 0 &&
+	   libbpf_probe_bpf_helper(BPF_PROG_TYPE_RAW_TRACEPOINT, prog->feat, NULL) != 1) {
+		return false;
+	}
+	if(prog->needs_bpf_atomics && !g_state.skel->rodata->g_bpf_atomics) {
+		log_msgf(FALCOSECURITY_LOG_SEV_DEBUG,
+		         "BPF program '%s' needs the BPF atomics, which this kernel does not have",
+		         prog->name);
+		return false;
+	}
+	return true;
+}
+
 int pman_prepare_progs_before_loading() {
 	/*
 	 * Probe required features for each bpf program, as requested
@@ -90,9 +119,7 @@ int pman_prepare_progs_before_loading() {
 		for(idx = 0; idx < MAX_FEATURE_CHECKS && progs[idx].name != NULL; idx++) {
 			bool should_disable = chosen_idx != -1;
 			if(!should_disable) {
-				if(progs[idx].feat > 0 &&
-				   libbpf_probe_bpf_helper(BPF_PROG_TYPE_RAW_TRACEPOINT, progs[idx].feat, NULL) !=
-				           1) {
+				if(!prog_requirements_met(&progs[idx])) {
 					log_msgf(FALCOSECURITY_LOG_SEV_DEBUG,
 					         "BPF program '%s' did not satisfy required feature [%d]",
 					         progs[idx].name,
@@ -282,6 +309,7 @@ void pman_close_probe() {
 	__atomic_store_n(&g_state.n_encountered_iters, 0, __ATOMIC_SEQ_CST);
 	g_state.is_tasks_dumping_supported = false;
 	g_state.is_task_files_dumping_supported = false;
+	memset(&g_state.bpf_iter_link_info_supp_info, 0, sizeof(g_state.bpf_iter_link_info_supp_info));
 
 #endif /* BPF_ITERATOR_SUPPORT */
 }

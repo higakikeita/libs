@@ -82,6 +82,7 @@ struct scap_vtable;
 #include <libscap/engine/kmod/kmod_public.h>
 #include <libscap/engine/modern_bpf/modern_bpf_public.h>
 #include <libscap/engine/nodriver/nodriver_public.h>
+#include <libscap/engine/raw_block/raw_block_public.h>
 #include <libscap/engine/savefile/savefile_public.h>
 #include <libscap/engine/source_plugin/source_plugin_public.h>
 #include <libscap/engine/test_input/test_input_public.h>
@@ -100,7 +101,7 @@ struct scap_vtable;
 // call `scap_get_driver_api_version()` and/or `scap_get_driver_schema_version()`
 // and handle the result
 //
-#define SCAP_MINIMUM_DRIVER_API_VERSION PPM_API_VERSION(10, 0, 0)
+#define SCAP_MINIMUM_DRIVER_API_VERSION PPM_API_VERSION(11, 0, 0)
 #define SCAP_MINIMUM_DRIVER_SCHEMA_VERSION PPM_API_VERSION(4, 3, 0)
 
 //

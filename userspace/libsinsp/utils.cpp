@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /*
-Copyright (C) 2023 The Falco Authors.
+Copyright (C) 2026 The Falco Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -603,14 +603,12 @@ static inline void rewind_to_parent_path(const char* targetbase,
 //                following parent directories
 //  - target_end: exclusive end of the output buffer (target + buffer_size)
 //  - path: the path to copy
-//  - path_end: exclusive end of the source buffer (path + path_len)
 //
-static inline void copy_and_sanitize_path(char* target,
-                                          char* targetbase,
-                                          char* target_end,
-                                          const char* path,
-                                          const char* path_end,
-                                          char separator) {
+static inline void copy_and_normalize_path(char* target,
+                                           char* targetbase,
+                                           char* target_end,
+                                           const char* path,
+                                           char separator) {
 	char* tc = target;
 	const char* pc = path;
 	const bool empty_base = target == targetbase;
@@ -630,97 +628,58 @@ static inline void copy_and_sanitize_path(char* target,
 			return;
 		}
 
-		if(const int seq_len = utf8_seq_len(reinterpret_cast<const unsigned char*>(pc),
-		                                    reinterpret_cast<const unsigned char*>(path_end));
-		   seq_len > 1) {
-			// Valid multibyte printable UTF-8 sequence. Copy all bytes as-is.
-			if(tc + seq_len >= target_end) {
-				*tc = 0;
-				return;
-			}
-			memcpy(tc, pc, static_cast<size_t>(seq_len));
-			tc += seq_len;
-			pc += seq_len;
-		} else if(seq_len < 0) {
-			// Invalid, broken, or valid-but-non-printable UTF-8 sequence `-seq_len` long. Replace
-			// with `U+FFFD` (EF BF BD) and advance by the number of bytes that form the sequence
-			// (i.e.: `-seq_len`).
-			if(tc + 3 >= target_end) {
-				*tc = 0;
-				return;
-			}
-			memcpy(tc, "\xEF\xBF\xBD", 3);
-			tc += 3;
-			pc += -seq_len;
-		} else {
-			// Printable ASCII (`seqlen == 1`). Apply path-aware logic.
-
-			// If path begins with '.' or '.' is the first char after a '/'
+		// If path begins with '.' or '.' is the first char after a '/'
+		if(*pc == '.' && (tc == targetbase || *(tc - 1) == separator)) {
 			//
-			if(*pc == '.' && (tc == targetbase || *(tc - 1) == separator)) {
-				//
-				// '../', rewind to the previous separator
-				//
-				if(*(pc + 1) == '.' && *(pc + 2) == separator) {
-					rewind_to_parent_path(targetbase, &tc, &pc, 3);
+			// '../', rewind to the previous separator
+			//
+			if(*(pc + 1) == '.' && *(pc + 2) == separator) {
+				rewind_to_parent_path(targetbase, &tc, &pc, 3);
+			}
+			//
+			// '..', with no separator.
+			// This is valid if we are at the end of the string, and in that case we rewind.
+			//
+			else if(*(pc + 1) == '.' && *(pc + 2) == 0) {
+				rewind_to_parent_path(targetbase, &tc, &pc, 2);
+			}
+			//
+			// './', just skip it
+			//
+			else if(*(pc + 1) == separator) {
+				pc += 2;
+			}
+			//
+			// '.', with no separator.
+			// This is valid if we are at the end of the string, and in that case we rewind.
+			//
+			else if(*(pc + 1) == 0) {
+				pc++;
+			}
+			//
+			// Otherwise, we leave the string intact.
+			//
+			else {
+				if(tc + 1 >= target_end) {
+					*tc = 0;
+					return;
 				}
-				//
-				// '..', with no separator.
-				// This is valid if we are at the end of the string, and in that case we rewind.
-				//
-				else if(*(pc + 1) == '.' && *(pc + 2) == 0) {
-					rewind_to_parent_path(targetbase, &tc, &pc, 2);
-				}
-				//
-				// './', just skip it
-				//
-				else if(*(pc + 1) == separator) {
-					pc += 2;
-				}
-				//
-				// '.', with no separator.
-				// This is valid if we are at the end of the string, and in that case we rewind.
-				//
-				else if(*(pc + 1) == 0) {
-					pc++;
-				}
-				//
-				// Otherwise, we leave the string intact.
-				//
-				else {
-					if(tc + 1 >= target_end) {
-						*tc = 0;
-						return;
-					}
-					*tc = *pc;
-					pc++;
-					tc++;
-				}
-			} else if(*pc == separator) {
-				//
-				// separator:
-				// * if the last char is already a separator, skip it
-				// * if we are back at targetbase but targetbase was not empty before, it means we
-				//   fully rewinded back to targetbase and the string is now empty. Skip separator.
-				//   Example: "/foo/../a" -> "/a" BUT "foo/../a" -> "a"
-				//   -> Otherwise: "foo/../a" -> "/a"
-				//
-				if((tc > targetbase && *(tc - 1) == separator) ||
-				   (tc == targetbase && !empty_base)) {
-					pc++;
-				} else {
-					if(tc + 1 >= target_end) {
-						*tc = 0;
-						return;
-					}
-					*tc = *pc;
-					tc++;
-					pc++;
-				}
+				*tc = *pc;
+				pc++;
+				tc++;
+			}
+		} else if(*pc == separator) {
+			//
+			// separator:
+			// * if the last char is already a separator, skip it
+			// * if we are back at targetbase but targetbase was not empty before, it means we
+			//   fully rewinded back to targetbase and the string is now empty. Skip separator.
+			//   Example: "/foo/../a" -> "/a" BUT "foo/../a" -> "a"
+			//   -> Otherwise: "foo/../a" -> "/a"
+			//
+			if((tc > targetbase && *(tc - 1) == separator) || (tc == targetbase && !empty_base)) {
+				pc++;
 			} else {
-				//
-				// Normal char, copy it
-				//
 				if(tc + 1 >= target_end) {
 					*tc = 0;
 					return;
@@ -729,53 +688,78 @@ static inline void copy_and_sanitize_path(char* target,
 				tc++;
 				pc++;
 			}
+		} else {
+			//
+			// Normal char, copy it
+			//
+			if(tc + 1 >= target_end) {
+				*tc = 0;
+				return;
+			}
+			*tc = *pc;
+			tc++;
+			pc++;
 		}
 	}
 }
 
-/*
- * Return false if path2 is an absolute path.
- * path1 MUST be '/' terminated.
- * path1 is not sanitized.
- * If path2 is absolute, we only account for it.
- */
-static inline bool concatenate_paths_(char* target,
-                                      uint32_t targetlen,
-                                      const char* path1,
-                                      uint32_t len1,
-                                      const char* path2,
-                                      uint32_t len2) {
-	// note: this is a loose check, as `len2` doesn't account any replacement character (3 bytes
-	// long) that would replace any `path2`'s UTF-8 invalid, broken or non-printable sequence
-	// (1-to-4 bytes long) during sanitization. Keep this loose and truncate the final string in
-	// case it becomes longer than `targetlen` during sanitization.
-	if(targetlen < (len1 + len2 + 1)) {
-		strlcpy(target, "/DIR_TOO_LONG/FILENAME_TOO_LONG", targetlen);
-		return false;
+// Normalize longer inputs before applying the output limit. Normalization only
+// removes bytes, so a raw path that exceeds SCAP_MAX_PATH_SIZE can still fit.
+// Keep the larger scratch buffer out of concatenate_paths' fast-path frame.
+#if defined(__GNUC__)
+[[gnu::noinline]]
+#endif
+static std::string concatenate_paths_normalized(const char* path1_data,
+                                                const size_t path1_len,
+                                                const char* path2_data,
+                                                const size_t path2_len) {
+	// Bound the raw copy of path1 and the normalization work.
+	if(path1_len + path2_len + 1 > SCAP_MAX_PATH_CONCAT_SIZE) {
+		return "/DIR_TOO_LONG/FILENAME_TOO_LONG";
 	}
 
-	char* target_end = target + targetlen;
-	const char* path2_end = path2 + len2;
-	if(len2 != 0 && path2[0] != '/') {
-		memcpy(target, path1, len1);
-		copy_and_sanitize_path(target + len1, target, target_end, path2, path2_end, '/');
-		return true;
+	char target[SCAP_MAX_PATH_CONCAT_SIZE];
+	char* target_end = target + SCAP_MAX_PATH_CONCAT_SIZE;
+
+	// Preserve the fast path's behavior: path1 is copied without normalization.
+	if(path2_len != 0 && path2_data[0] != '/') {
+		memcpy(target, path1_data, path1_len);
+		copy_and_normalize_path(target + path1_len, target, target_end, path2_data, '/');
 	} else {
 		target[0] = 0;
-		copy_and_sanitize_path(target, target, target_end, path2, path2_end, '/');
-		return false;
+		if(path2_len != 0) {
+			copy_and_normalize_path(target, target, target_end, path2_data, '/');
+		}
 	}
+
+	// Apply the limit to the normalized result, including its terminator.
+	if(strlen(target) + 1 > SCAP_MAX_PATH_SIZE) {
+		return "/DIR_TOO_LONG/FILENAME_TOO_LONG";
+	}
+
+	return target;
 }
 
-std::string sinsp_utils::concatenate_paths(std::string_view path1, std::string_view path2) {
-	char fullpath[SCAP_MAX_PATH_SIZE];
-	concatenate_paths_(fullpath,
-	                   SCAP_MAX_PATH_SIZE,
-	                   path1.data(),
-	                   (uint32_t)path1.length(),
-	                   path2.data(),
-	                   path2.size());
-	return std::string(fullpath);
+std::string sinsp_utils::concatenate_paths(const std::string_view path1,
+                                           const std::string_view path2) {
+	char target[SCAP_MAX_PATH_SIZE];
+	const auto path1_len = path1.length();
+	const auto path2_len = path2.length();
+	if(path1_len + path2_len + 1 > SCAP_MAX_PATH_SIZE) {
+		return concatenate_paths_normalized(path1.data(), path1_len, path2.data(), path2_len);
+	}
+
+	const auto path1_data = path1.data();
+	const auto path2_data = path2.data();
+	char* target_end = target + SCAP_MAX_PATH_SIZE;
+	if(path2_len != 0 && path2[0] != '/') {
+		memcpy(target, path1_data, path1_len);
+		copy_and_normalize_path(target + path1_len, target, target_end, path2_data, '/');
+	} else {
+		target[0] = 0;
+		copy_and_normalize_path(target, target, target_end, path2_data, '/');
+	}
+	return target;
 }
 
 bool sinsp_utils::is_ipv4_mapped_ipv6(const uint8_t* paddr) {
@@ -878,25 +862,32 @@ void sinsp_utils::ts_to_string(uint64_t ts, std::string* res, bool date, bool ns
 		Time = (sec + thiszone) - s;
 		tm = gmtime_r(&Time, &tm_buf);
 		if(!tm) {
-			bufsize = sprintf(buf, "<date error> ");
+			bufsize = snprintf(buf, sizeof(buf), "<date error> ");
 		} else {
-			bufsize = sprintf(buf,
-			                  "%04d-%02d-%02d ",
-			                  tm->tm_year + 1900,
-			                  tm->tm_mon + 1,
-			                  tm->tm_mday);
+			bufsize = snprintf(buf,
+			                   sizeof(buf),
+			                   "%04d-%02d-%02d ",
+			                   tm->tm_year + 1900,
+			                   tm->tm_mon + 1,
+			                   tm->tm_mday);
 		}
 	}
 
 	if(ns) {
-		sprintf(buf + bufsize,
-		        "%02d:%02d:%02d.%09u",
-		        s / 3600,
-		        (s % 3600) / 60,
-		        s % 60,
-		        (unsigned)nsec);
+		snprintf(buf + bufsize,
+		         sizeof(buf) - bufsize,
+		         "%02d:%02d:%02d.%09u",
+		         s / 3600,
+		         (s % 3600) / 60,
+		         s % 60,
+		         (unsigned)nsec);
 	} else {
-		sprintf(buf + bufsize, "%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60);
+		snprintf(buf + bufsize,
+		         sizeof(buf) - bufsize,
+		         "%02d:%02d:%02d",
+		         s / 3600,
+		         (s % 3600) / 60,
+		         s % 60);
 	}
 
 	*res = buf;
@@ -916,7 +907,7 @@ void sinsp_utils::ts_to_iso_8601(uint64_t ts, std::string* res) {
 	}
 
 	*res = buf;
-	if(sprintf(buf, ".%09u", (unsigned)ns) < 0) {
+	if(snprintf(buf, sizeof(buf), ".%09u", (unsigned)ns) < 0) {
 		*res = fmt;
 		return;
 	}

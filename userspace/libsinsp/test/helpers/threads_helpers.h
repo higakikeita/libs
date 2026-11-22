@@ -22,6 +22,20 @@ limitations under the License.
 
 #define HUGE_THREAD_NUMBER 150
 
+/* With the concurrent thread table (LIBSINSP_USE_FOLLY), the entry of a removed thread is destroyed
+ * when the hazard pointer domain of the map reclaims it, and not when it is erased. So an object that
+ * the removed thread kept alive (for example its thread group) is freed at an unspecified later time,
+ * and a test cannot wait for it. The test checks that the object is freed only with the
+ * single-threaded table; the links that decide when it is freed are checked in both builds.
+ */
+#ifdef LIBSINSP_USE_FOLLY
+#define ASSERT_RECLAIMED(weak) \
+	do {                       \
+	} while(0)
+#else
+#define ASSERT_RECLAIMED(weak) ASSERT_TRUE((weak).expired())
+#endif
+
 #define ASSERT_THREAD_INFO_PIDS_IN_CONTAINER(tid, pid, ptid, vtid, vpid)                      \
 	{                                                                                         \
 		sinsp_threadinfo* tinfo = m_inspector.m_thread_manager->find_thread(tid, true).get(); \
@@ -76,29 +90,28 @@ limitations under the License.
 		ASSERT_EQ(not_expired_count, not_expired);                                      \
 	}
 
-#define ASSERT_THREAD_CHILDREN(parent_tid, children_num, not_expired, ...)                     \
-	{                                                                                          \
-		const auto& thread_manager = m_inspector.m_thread_manager;                             \
-		sinsp_threadinfo* parent_tinfo = thread_manager->find_thread(parent_tid, true).get();  \
-		ASSERT_TRUE(parent_tinfo);                                                             \
-		ASSERT_EQ(parent_tinfo->get_children_count(), children_num);                           \
-		std::set<int64_t> tid_to_assert{__VA_ARGS__};                                          \
-		for(const auto& tid : tid_to_assert) {                                                 \
-			sinsp_threadinfo* tid_tinfo = thread_manager->find_thread(tid, true).get();        \
-			ASSERT_TRUE(tid_tinfo);                                                            \
-			bool found = false;                                                                \
-			parent_tinfo->for_each_child([&](const std::shared_ptr<sinsp_threadinfo>& child) { \
-				if(child.get() == tid_tinfo) {                                                 \
-					found = true;                                                              \
-				}                                                                              \
-			});                                                                                \
-			ASSERT_TRUE(found);                                                                \
-		}                                                                                      \
-		uint16_t not_expired_count = 0;                                                        \
-		parent_tinfo->for_each_child(                                                          \
-		        [&](const std::shared_ptr<sinsp_threadinfo>&) { not_expired_count++; });       \
-		ASSERT_EQ(not_expired_count, not_expired);                                             \
-		ASSERT_EQ(not_expired_count, parent_tinfo->get_not_expired_children());                \
+/* The children of a thread are the threads in the table that have it as their parent. The macro
+ * tests only `not_expired`.
+ */
+#define ASSERT_THREAD_CHILDREN(parent_tid, children_num, not_expired, ...)                    \
+	{                                                                                         \
+		const auto& thread_manager = m_inspector.m_thread_manager;                            \
+		auto parent_tinfo = thread_manager->find_thread(parent_tid, true);                    \
+		ASSERT_TRUE(parent_tinfo);                                                            \
+		std::set<const sinsp_threadinfo*> children;                                           \
+		thread_manager->loop_threads([&](const sinsp_threadinfo& tinfo) {                     \
+			if(thread_manager->get_parent_thread(tinfo) == parent_tinfo) {                    \
+				children.insert(&tinfo);                                                      \
+			}                                                                                 \
+			return true;                                                                      \
+		});                                                                                   \
+		std::set<int64_t> tid_to_assert{__VA_ARGS__};                                         \
+		for(const auto& tid : tid_to_assert) {                                                \
+			auto tid_tinfo = thread_manager->find_thread(tid, true);                          \
+			ASSERT_TRUE(tid_tinfo);                                                           \
+			ASSERT_TRUE(children.count(tid_tinfo.get()));                                     \
+		}                                                                                     \
+		ASSERT_EQ(children.size(), not_expired);                                              \
 	}
 
 /* if `missing==true` we shouldn't find the thread info */

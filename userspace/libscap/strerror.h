@@ -21,6 +21,8 @@ limitations under the License.
 #include <stdint.h>
 
 #include <libscap/scap_const.h>
+#include <libscap/scap_likely.h>
+#include <libscap/scap_assert.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,6 +47,14 @@ void scap_set_thread_lasterr(char* buf);
 void scap_clear_thread_lasterr(void);
 /** Return thread-local error buffer if set, otherwise NULL. */
 const char* scap_get_thread_lasterr(void);
+
+#define SCAP_ASSERT_OR_RETURN(COND, BUF, ERRNUM, ...)        \
+	do {                                                     \
+		if(scap_unlikely(COND)) {                            \
+			ASSERT(!(#COND));                                \
+			return scap_errprintf(BUF, ERRNUM, __VA_ARGS__); \
+		}                                                    \
+	} while(0)
 
 static inline int32_t scap_err_opnotsup(char* error) {
 	(void)scap_errprintf(error, 0, "operation not supported");

@@ -135,19 +135,17 @@ public:
 	}
 
 	//
-	// Extract the field from the event. If sanitize_strings is true, any
-	// string values are sanitized to remove nonprintable characters.
+	// Extract the field from the event.
 	// By default, this fills the vector with only one value, retrieved by calling the single-result
 	// extract method.
 	// If a NULL value is returned by extract, the vector is emptied.
 	// Subclasses are meant to either override this, or the single-valued extract method.
 	//
 	// \param values [out] the values extracted from the filter check
-	bool extract(sinsp_evt*, std::vector<extract_value_t>& values, bool sanitize_strings = true);
+	bool extract(sinsp_evt*, std::vector<extract_value_t>& values);
 
 	//
-	// Extract a field from the event along with its offsets. If sanitize_strings
-	// is true, any string values are sanitized to remove nonprintable characters.
+	// Extract a field from the event along with its offsets.
 	// By default, this fills the value and offset vectors with only one value,
 	// retrieved by calling the single-result extract method.
 	// If a NULL value is returned by extract, the vectors are emptied.
@@ -157,8 +155,7 @@ public:
 	// \param offsets [out] the field offsets extracted from the filter check
 	bool extract_with_offsets(sinsp_evt*,
 	                          std::vector<extract_value_t>& values,
-	                          std::vector<extract_offset_t>& offsets,
-	                          bool sanitize_strings = true);
+	                          std::vector<extract_offset_t>& offsets);
 
 	//
 	// Compare the field with the constant value obtained from parse_filter_value()
@@ -182,6 +179,8 @@ public:
 	std::shared_ptr<sinsp_filter_extract_cache> m_extract_cache = nullptr;
 	std::shared_ptr<sinsp_filter_cache_metrics> m_cache_metrics = nullptr;
 	boolop m_boolop = BO_NONE;
+	// Set before the right-hand values are added, and not changed once the check has compared: the
+	// resolved shapes below are worked out from it on first use, and nothing watches it change.
 	comparator m_cmp;
 
 	char* rawval_to_string(uint8_t* rawval,
@@ -191,6 +190,54 @@ public:
 
 protected:
 	virtual bool compare_nocache(sinsp_evt*);
+
+	//
+	// Extract the values and report where they ended up rather than moving them: this check's own
+	// vector on a cache miss, the cache's on a hit. m_values_in_place points at whichever it was,
+	// and the comparison family reads them from there.
+	//
+	// The extraction cache's wrapper, in the header because it is one: what a check specialises is
+	// extract_nocache() below, so this is a frame that only decides whether to call it -- and the
+	// checks that call this one most often live in other translation units.
+	//
+	inline bool extract_in_place(sinsp_evt* evt) {
+		if(m_cache_metrics != NULL) {
+			m_cache_metrics->m_num_extract++;
+		}
+
+		// no cache is installed, so just default to non-cached extraction
+		if(!m_extract_cache) {
+			m_values_in_place = &m_extracted_values;
+			// extract values and apply transformers on top of them
+			return extract_nocache(evt, m_extracted_values, nullptr) &&
+			       apply_transformers(m_extracted_values);
+		}
+
+		// cache is not valid for this event, so we perform a non-cached extraction
+		// and update it for the next time. We cache both failed and succeeded extractions
+		if(!m_extract_cache->is_valid(evt)) {
+			// The cached values are shallow copies: this check keeps owning what they point at
+			// across extractions, which is what lets a hit be read in place.
+			m_values_in_place = &m_extracted_values;
+			auto res = extract_nocache(evt, m_extracted_values, nullptr) &&
+			           apply_transformers(m_extracted_values);
+			m_extract_cache->update(evt, res, m_extracted_values);
+			return res;
+		}
+
+		// cache hit: the values stay where they are. The cache holds shallow copies, so they point
+		// at whatever the extracting check owns either way -- copying the vector out only moved the
+		// pointers, it did not make them any safer to hold.
+		m_values_in_place = &m_extract_cache->values();
+		if(m_cache_metrics != NULL) {
+			m_cache_metrics->m_num_extract_cache++;
+		}
+		return m_extract_cache->result();
+	}
+
+	// Where the last extraction's values are: m_extracted_values, or the extract cache's own vector
+	// on a hit. Only valid right after extract_in_place().
+	const std::vector<extract_value_t>* m_values_in_place = nullptr;
 
 	virtual Json::Value extract_as_js(sinsp_evt*, uint32_t* len) { return Json::nullValue; }
 
@@ -208,8 +255,7 @@ protected:
 	// Common implementation of extract and the public version of extract_with_offsets.
 	bool extract_with_offsets(sinsp_evt*,
 	                          std::vector<extract_value_t>& values,
-	                          std::vector<extract_offset_t>* offsets,
-	                          bool sanitize_strings = true);
+	                          std::vector<extract_offset_t>* offsets);
 
 	// This is a single-value version of extract for subclasses non supporting extracting
 	// multiple values. By default, this returns NULL.
@@ -218,27 +264,68 @@ protected:
 	// \param values [out] the values extracted from the filter check
 	virtual bool extract_nocache(sinsp_evt* evt,
 	                             std::vector<extract_value_t>& values,
-	                             std::vector<extract_offset_t>* offsets,
-	                             bool sanitize_strings = true);
+	                             std::vector<extract_offset_t>* offsets);
 	// \param len [out] length in bytes for the returned value
-	virtual uint8_t* extract_single(sinsp_evt*, uint32_t* len, bool sanitize_strings = true);
+	virtual uint8_t* extract_single(sinsp_evt*, uint32_t* len);
 
 	bool compare_rhs(comparator cmp,
 	                 ppm_param_type type,
 	                 const void* operand1,
 	                 uint32_t op1_len = 0);
-	bool compare_rhs(comparator cmp, ppm_param_type type, std::vector<extract_value_t>& values);
+	// Hot and small, so it lives here rather than being a call of its own: the three questions it
+	// used to ask on every event are resolved once (see rhs_path), which leaves one test against
+	// zero, and one extracted value then goes straight to the comparison above. Anything else --
+	// no value, or more than one from a field that promised one -- is cold and out of line.
+	inline bool compare_rhs(comparator cmp,
+	                        ppm_param_type type,
+	                        const std::vector<extract_value_t>& values) {
+		if(m_rhs_path != rhs_path::single) {
+			if(m_rhs_path == rhs_path::unresolved) {
+				resolve_rhs_path(cmp);
+			}
+			if(m_rhs_path != rhs_path::single) {
+				return compare_rhs_multi(cmp, type, values);
+			}
+		}
+		ASSERT(cmp.op == m_rhs_path_for.op && cmp.mod == m_rhs_path_for.mod);
+
+		if(values.size() != 1) {
+			return no_single_value(values);
+		}
+		// The resolved shape is a function; the type test is what keeps a check that rewrites its
+		// own type between events (evt.rawarg.*) from being compared through the shape of the last
+		// one. Anything unresolved, or a width the shape does not cover, goes the general way.
+		if(m_cmp_fn != nullptr && type == m_fast_cmp_type) {
+			const int8_t res = m_cmp_fn(this, m_cmp, values[0].ptr, values[0].len);
+			if(res >= 0) {
+				return res != 0;
+			}
+		}
+		return compare_rhs(m_cmp, type, values[0].ptr, values[0].len);
+	}
 	bool compare_rhs_with_mod(comparator cmp,
 	                          ppm_param_type type,
-	                          std::vector<extract_value_t>& values);
+	                          const std::vector<extract_value_t>& values);
+	[[nodiscard]] bool matches_rhs_regex(const filter_value_t& item,
+	                                     const uint16_t regex_idx) const;
 	bool matches_rhs_elem(const filter_value_t& item,
 	                      uint16_t i,
 	                      comparator cmp,
 	                      ppm_param_type type);
+	// Return true if the extracted value matches exactly one RHS value.
+	// note: `n_rhs` must be greater than 0.
+	bool matches_one_rhs(const filter_value_t& item,
+	                     uint16_t n_rhs,
+	                     comparator cmp,
+	                     ppm_param_type type);
+	// Return true if the extracted value matches at least one RHS value.
+	// note: `n_rhs` must be greater than 0.
 	bool matches_any_rhs(const filter_value_t& item,
 	                     uint16_t n_rhs,
 	                     comparator cmp,
 	                     ppm_param_type type);
+	// Return true if the extracted value matches all RHS values.
+	// note: `n_rhs` must be greater than 0.
 	bool matches_all_rhs(const filter_value_t& item,
 	                     uint16_t n_rhs,
 	                     comparator cmp,
@@ -248,6 +335,135 @@ protected:
 	                           ppm_param_type ptype,
 	                           ppm_print_format print_format,
 	                           uint32_t len);
+
+	// A comparison whose field type and operator were both settled when the filter was compiled
+	// does not have to rediscover them on every event. flt_compare() switches over thirty field
+	// types and then over the operator, and casts both operands through memcpy on the way. With
+	// one constant right-hand value and no modifier, the shape -- an integer of a given width and
+	// signedness, a string equality or substring test, an IPv4 address or network, an IPv6
+	// address -- is resolved on the first comparison, with the right-hand side decoded once.
+	// Everything else resolves to `none` and goes through flt_compare: a right-hand side that is a
+	// field, lists, modifiers, IPv6 networks, doubles, byte buffers, PMATCH and REGEX.
+	// `unresolved` is the state before the first comparison, and after invalidate_resolved().
+	enum class fast_cmp : uint8_t {
+		none = 0,
+		unresolved,
+		// Every integer field, by width and signedness. All of them widen to 64 bits and compare
+		// there, which is what flt_compare did too -- only it rediscovered the width, the
+		// signedness and the operator on every event. Keeping the width in the kind is what makes
+		// the load and the sign extension compile-time constants rather than a second dispatch.
+		s8,
+		s16,
+		s32,
+		s64,
+		u8,
+		u16,
+		u32,
+		u64,
+		str_eq,
+		str_ne,
+		str_startswith,
+		str_contains,
+		str_endswith,
+		// Addresses and networks. An address comparison is a fixed-width compare; a network
+		// comparison is the AND that flt_compare_ipv4net does, with the network's own masking done
+		// here instead of on every event.
+		ip4,
+		ip6,
+		net4,
+	};
+	// The resolved shape as something to CALL, rather than a kind to switch on. Two instructions at
+	// the call site -- a load and an indirect call -- so a caller holding one value reaches the
+	// comparison without the operator switch in compare_rhs and without a frame of its own, and
+	// nothing grows for the checks whose shape is `none`. Each function IS one shape: the kind was
+	// chosen once, so there is nothing left to dispatch on. -1 comes back when the value arrived at
+	// a width the shape was not resolved for -- evt.rawarg.* can do that -- and the general path
+	// takes it from there.
+	using resolved_cmp_fn = int8_t (*)(sinsp_filter_check*, comparator, const void*, uint32_t);
+
+	template<typename T>
+	static int8_t resolved_cmp_signed(sinsp_filter_check*, comparator, const void*, uint32_t);
+	template<typename T>
+	static int8_t resolved_cmp_unsigned(sinsp_filter_check*, comparator, const void*, uint32_t);
+	static int8_t resolved_cmp_str_eq(sinsp_filter_check*, comparator, const void*, uint32_t);
+	static int8_t resolved_cmp_str_ne(sinsp_filter_check*, comparator, const void*, uint32_t);
+	static int8_t resolved_cmp_str_startswith(sinsp_filter_check*,
+	                                          comparator,
+	                                          const void*,
+	                                          uint32_t);
+	static int8_t resolved_cmp_str_contains(sinsp_filter_check*, comparator, const void*, uint32_t);
+	static int8_t resolved_cmp_str_endswith(sinsp_filter_check*, comparator, const void*, uint32_t);
+	static int8_t resolved_cmp_ip4(sinsp_filter_check*, comparator, const void*, uint32_t);
+	static int8_t resolved_cmp_net4(sinsp_filter_check*, comparator, const void*, uint32_t);
+	static int8_t resolved_cmp_ip6(sinsp_filter_check*, comparator, const void*, uint32_t);
+
+	// Which of them a resolved kind means, decided with the kind itself.
+	static resolved_cmp_fn resolved_cmp_for(fast_cmp kind);
+
+	void resolve_fast_cmp_kind(comparator cmp, ppm_param_type type);
+
+	resolved_cmp_fn m_cmp_fn = nullptr;
+	fast_cmp m_fast_cmp = fast_cmp::unresolved;
+	comparator m_fast_cmp_for = {};
+	// The type the shape was resolved for. A few checks compare more than one type through the same
+	// object -- sinsp_filter_check_fd hands compare_rhs a v4 address or a v6 one depending on the
+	// fd -- so a resolved shape belongs to its type and is re-resolved if that changes.
+	ppm_param_type m_fast_cmp_type = PT_NONE;
+	int64_t m_fast_rhs_s64 = 0;
+	uint64_t m_fast_rhs_u64 = 0;
+	// For startswith and endswith: the right-hand side's length, which flt_compare_string measures
+	// on every event even though the filter fixed it at compile time.
+	size_t m_fast_rhs_len = 0;
+	// For ip6: the address, as two words. For net4: the mask, with the masked network in
+	// m_fast_rhs_u64.
+	uint64_t m_fast_ip6[2] = {0, 0};
+	uint32_t m_fast_mask4 = 0;
+
+	// Decides which of the above applies to this check, given the type it is comparing.
+	void resolve_fast_cmp(comparator cmp, ppm_param_type type);
+
+	// Forgets everything resolved on first use, for the calls that change what it was resolved
+	// from: add_filter_value() and add_transformer().
+	void invalidate_resolved();
+
+	// What the vector-taking compare_rhs does with the extracted values is settled by the compiled
+	// filter too: whether the field is a list, whether the operator carries a modifier, and whether
+	// it is `exists` at all. Rediscovering that per event cost a virtual call, because
+	// get_transformed_field_info() is virtual and a comparison asked it for the field on every
+	// event. What is cached is the INFO, not the type read out of it: a check may rewrite its own
+	// type per event -- evt.rawarg.* does, because a parameter's type is only known from the event
+	// -- and the pointer stays put while that happens. A transformer is what makes the accessor
+	// start answering something else, so add_transformer() clears this.
+	const filtercheck_field_info* m_lhs_info = nullptr;
+
+	inline const filtercheck_field_info* lhs_info() {
+		if(m_lhs_info == nullptr) {
+			m_lhs_info = get_transformed_field_info();
+		}
+		return m_lhs_info;
+	}
+
+	// get_transformed_field_info() plus three tests; resolved once, the common case is one compare.
+	// `single` is zero so that case tests against zero.
+	enum class rhs_path : uint8_t {
+		single = 0,
+		unresolved,
+		exists,
+		list,
+		modifier,
+	};
+	rhs_path m_rhs_path = rhs_path::unresolved;
+	comparator m_rhs_path_for = {};
+	void resolve_rhs_path(comparator cmp);
+
+	// The cold end of the single-value path: no value at all is a failed comparison, and more than
+	// one from a field that is not a list is a bug in that field.
+	bool no_single_value(const std::vector<extract_value_t>& values);
+	// The list, exists and modifier paths. Out of line to keep the hot one small: the list block
+	// alone is longer than everything it shares the function with.
+	bool compare_rhs_multi(comparator cmp,
+	                       ppm_param_type type,
+	                       const std::vector<extract_value_t>& values);
 
 	inline uint8_t* filter_value_p(uint16_t i = 0) {
 		ASSERT(i < m_vals.size());
@@ -270,46 +486,6 @@ protected:
 
 	inline void check_rhs_field_type_consistency() const;
 
-	// Storage for sanitized strings, lazily allocated on the first encountered invalid string.
-	// This is not a plain `std::string` to save space: `std::unique_ptr` adds 8 bytes to the filter
-	// check memory footprint on 64 bits platforms, while `std::string` adds 32 bytes. The smaller
-	// the objects are, the greater is the number of the ones that can fit in cache. The additional
-	// memory cost is only paid (on the heap) if the single filter check ever encounters an invalid
-	// string.
-	std::unique_ptr<std::string> m_sanitized_str_storage;
-
-	// Helper that must be used while extracting a single string value. It returns a pointer to the
-	// first character of `str` and sets `*len` to the string length. If `must_sanitize` is true and
-	// `str` contains invalid UTF-8 sequences, the sanitized copy is written into
-	// `m_sanitized_str_storage` (lazily allocated on first use) and a pointer to it is returned
-	// instead.
-	uint8_t* extract_single_string(const std::string& str,
-	                               uint32_t* len,
-	                               const bool must_sanitize) {
-		const auto* const ptr = str.data();
-		*len = str.size();
-		if(!must_sanitize) {
-			return const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(ptr));
-		}
-		return extract_single_sanitized_string(ptr, *len, len, m_sanitized_str_storage);
-	}
-
-	// Helper that must be used while extracting a single C string value. It returns `str` and sets
-	// `*len` to `strlen(str)`. Returns nullptr if `str` is nullptr, leaving `*len` unset.
-	// If `must_sanitize` is true and the string contains invalid UTF-8 sequences, the sanitized
-	// copy is written into `m_sanitized_str_storage` (lazily allocated on first use) and a pointer
-	// to it is returned instead.
-	uint8_t* extract_single_cstring(const char* str, uint32_t* len, const bool must_sanitize) {
-		if(str == nullptr) {
-			return nullptr;
-		}
-		*len = strlen(str);
-		if(!must_sanitize) {
-			return const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(str));
-		}
-		return extract_single_sanitized_string(str, *len, len, m_sanitized_str_storage);
-	}
-
 	// Helper that must be used while extracting a single value. It returns a pointer to `val` and
 	// sets `*len` to `sizeof(val)`.
 	template<typename T,
@@ -319,42 +495,39 @@ protected:
 		return const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(&val));
 	}
 
+	// Helper that must be used while extracting a single string value. It returns a pointer to the
+	// first character of `str` and sets `*len` to the string length.
+	static uint8_t* extract_single_string(const std::string& str, uint32_t* len) {
+		*len = str.size();
+		return const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(str.data()));
+	}
+
+	// Helper that must be used while extracting a single C string value. It returns `str` and sets
+	// `*len` to `strlen(str)`. Returns nullptr if `str` is nullptr, leaving `*len` unset.
+	static uint8_t* extract_single_cstring(const char* str, uint32_t* len) {
+		if(str == nullptr) {
+			return nullptr;
+		}
+		*len = strlen(str);
+		return const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(str));
+	}
+
 	void set_transformed_field(std::unique_ptr<filtercheck_field_info> field) {
 		m_transformed_field = std::move(field);
 	}
 
 private:
-	// Checks `str` for invalid UTF-8:
-	// - if valid, returns the original pointer (leaving `*len` unchanged)
-	// - if invalid, writes the sanitized version into `*storage` (lazily allocated on first use),
-	//   updates `*len`, and returns a pointer to the sanitized data.
-	// Callers must set `*len` to `str_len` before calling.
-	static uint8_t* extract_single_sanitized_string(const char* str,
-	                                                const size_t str_len,
-	                                                uint32_t* len,
-	                                                std::unique_ptr<std::string>& storage) {
-		const auto* const ptr = reinterpret_cast<const unsigned char*>(str);
-		const auto* const end_ptr = ptr + str_len;
-		const auto* const first_invalid_ptr = utf8_first_invalid_seq(ptr, end_ptr);
-		// String already sanitized, return it.
-		if(first_invalid_ptr == end_ptr) {
-			return const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(ptr));
-		}
-
-		// String needs sanitization. Store the sanitized version in `*storage` and return a pointer
-		// to it.
-		if(!storage) {
-			storage = std::make_unique<std::string>();
-		}
-		const auto valid_prefix_len = static_cast<size_t>(first_invalid_ptr - ptr);
-		const std::string_view str_to_sanitize{str, str_len};
-		storage->clear();  // Reset to empty while preserving allocated capacity.
-		storage->reserve(str_len);
-		append_sanitized_string(*storage, str_to_sanitize, valid_prefix_len);
-		*len = static_cast<uint32_t>(storage->size());
-		return reinterpret_cast<uint8_t*>(storage->data());
-	}
-
+	// Storage for sanitized strings, lazily allocated on the first encountered invalid string.
+	// This is not a plain `std::string` to save space: `std::unique_ptr` adds 8 bytes to the filter
+	// check memory footprint on 64 bits platforms, while `std::string` adds 32 bytes. The smaller
+	// the objects are, the greater is the number of the ones that can fit in cache. The additional
+	// memory cost is only paid (on the heap) if the single filter check ever encounters an invalid
+	// string.
+	std::unique_ptr<std::string> m_sanitized_str_storage;
+	inline filter_value_t craft_filter_value(ppm_param_type type,
+	                                         const void* value,
+	                                         uint32_t len,
+	                                         cmpop op);
 	//
 	// Instead of populating the filter check values with const values extracted at
 	// filter compile time, it populates the filter check values with values extracted

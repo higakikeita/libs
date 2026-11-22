@@ -75,6 +75,24 @@ __weak const volatile uint16_t ringbufs_num;
  */
 __weak const volatile uint8_t max_iters_num = 1;
 
+/**
+ * @brief Number of entries in the `auxiliary_maps` array, which userspace sizes.
+ *
+ * The bound for the cross-pool search in auxmap__find_owned_slot(); a runtime bound the
+ * verifier knows, so the loop is accepted and walked exactly as far as the array goes.
+ */
+__weak const volatile uint32_t g_auxmap_pool_entries;
+
+/**
+ * @brief Whether this kernel has the atomics added in 5.12 (BPF_CMPXCHG).
+ *
+ * Userspace probes for it and sets this before load, which picks the branch of auxmap__claim()
+ * that this kernel can run. When the atomics are missing, libpman also has to patch the cmpxchg
+ * out of the dead branch, because a pre-5.12 verifier rejects the instruction whether or not it
+ * can be reached. See prepare_bpf_atomics().
+ */
+__weak const volatile uint8_t g_bpf_atomics;
+
 /*=============================== BPF READ-ONLY GLOBAL VARIABLES ===============================*/
 
 /*=============================== BPF GLOBAL VARIABLES ===============================*/
@@ -94,14 +112,12 @@ __weak void *socket_file_ops = NULL;
  * @brief An integer used by the `dump_task_file` BPF iterator program which specific file to dump
  * based on its file descriptor. If set to -1, the filter-by-fd logic is not applied.
  */
-
 __weak int64_t dump_task_file__fd_filter = -1;
 
 /**
  * @brief A boolean used by the `dump_task_file` BPF iterator program to determine if socket files
  * info must be sent to userspace or skipped.
  */
-
 __weak bool dump_task_file__must_dump_sockets = true;
 
 /*=============================== BPF GLOBAL VARIABLES ===============================*/

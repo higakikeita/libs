@@ -301,7 +301,7 @@ static uint32_t scap_linux_get_device_by_mount_id_impl(struct scap_linux_platfor
 }
 
 uint32_t scap_linux_get_device_by_mount_id(struct scap_platform *platform,
-                                           const char *procdir,
+                                           const int64_t tid,
                                            unsigned long requested_mount_id) {
 	struct scap_linux_platform *linux_platform = (struct scap_linux_platform *)platform;
 
@@ -311,9 +311,13 @@ uint32_t scap_linux_get_device_by_mount_id(struct scap_platform *platform,
 		return mountinfo->dev;
 	}
 
-	char fd_dir_name[SCAP_MAX_PATH_SIZE];
-	snprintf(fd_dir_name, SCAP_MAX_PATH_SIZE, "%smountinfo", procdir);
-	const int fd = open(fd_dir_name, O_RDONLY, 0);
+	char filename[SCAP_MAX_PATH_SIZE];
+	snprintf(filename,
+	         sizeof(filename),
+	         "%s/proc/%" PRIu64 "/mountinfo",
+	         scap_get_host_root(),
+	         tid);
+	const int fd = open(filename, O_RDONLY, 0);
 	if(fd < 0) {
 		return 0;
 	}
@@ -615,6 +619,26 @@ static bool scan_ipv4_socket_table_address(char **str, uint32_t *ip_out, uint16_
 	return true;
 }
 
+// Insert `fdinfo` keyed by inode. Procfs socket scans can contain repeated inodes, while uthash
+// permits duplicate keys. If the inode already exists, update its socket metadata in place and
+// free `fdinfo`. On success, this function takes ownership of `fdinfo`; on failure, ownership
+// remains with the caller.
+static int32_t scap_fd_add_socket_to_table(scap_fdinfo **sockets, scap_fdinfo *fdinfo) {
+	int32_t uth_status = SCAP_SUCCESS;
+	scap_fdinfo *existing = NULL;
+
+	HASH_FIND_INT64(*sockets, &fdinfo->ino, existing);
+	if(existing != NULL) {
+		existing->type = fdinfo->type;
+		memcpy(&existing->info, &fdinfo->info, sizeof(existing->info));
+		free(fdinfo);
+		return SCAP_SUCCESS;
+	}
+
+	HASH_ADD_INT64(*sockets, ino, fdinfo);
+	return uth_status;
+}
+
 // Parse a single IPv4 socket table line and insert the obtained fdinfo into `sockets`. Return
 // `SCAP_SUCCESS` if it can correctly parse the line or encounters a recoverable error (e.g.: the
 // line could be simply skipped); return `SCAP_FAILURE` otherwise.
@@ -677,9 +701,7 @@ static int32_t parse_ipv4_socket_table_line(const char *const line_start,
 	}
 
 	// Add to the table.
-	int32_t uth_status = SCAP_SUCCESS;
-	HASH_ADD_INT64((*sockets), ino, fdinfo);
-	if(uth_status != SCAP_SUCCESS) {
+	if(scap_fd_add_socket_to_table(sockets, fdinfo) != SCAP_SUCCESS) {
 		free(fdinfo);
 		return scap_errprintf(error, 0, "IPv4 socket allocation error");
 	}
@@ -800,9 +822,7 @@ static int32_t parse_ipv6_socket_table_line(const char *const line_start,
 	}
 
 	// Add to the table.
-	int32_t uth_status = SCAP_SUCCESS;
-	HASH_ADD_INT64((*sockets), ino, fdinfo);
-	if(uth_status != SCAP_SUCCESS) {
+	if(scap_fd_add_socket_to_table(sockets, fdinfo) != SCAP_SUCCESS) {
 		free(fdinfo);
 		return scap_errprintf(error, 0, "IPv6 socket allocation error");
 	}
@@ -864,9 +884,7 @@ static int32_t parse_unix_socket_table_line(const char *const line_start,
 	}
 
 	// Add to the table.
-	int32_t uth_status = SCAP_SUCCESS;
-	HASH_ADD_INT64((*sockets), ino, fdinfo);
-	if(uth_status != SCAP_SUCCESS) {
+	if(scap_fd_add_socket_to_table(sockets, fdinfo) != SCAP_SUCCESS) {
 		free(fdinfo);
 		return scap_errprintf(error, 0, "unix socket allocation error");
 	}
@@ -916,9 +934,7 @@ static int32_t parse_netlink_socket_table_line(const char *const line_start,
 	fdinfo->ino = ino;
 
 	// Add to the table.
-	int32_t uth_status = SCAP_SUCCESS;
-	HASH_ADD_INT64((*sockets), ino, fdinfo);
-	if(uth_status != SCAP_SUCCESS) {
+	if(scap_fd_add_socket_to_table(sockets, fdinfo) != SCAP_SUCCESS) {
 		free(fdinfo);
 		return scap_errprintf(error, 0, "netlink socket allocation error");
 	}
@@ -1070,7 +1086,7 @@ static int32_t parse_procfs_proc_pid_socket_table_file(const char *filename,
 }
 
 int32_t scap_fd_read_sockets_impl(char *procdir, struct scap_ns_socket_list *sockets, char *error) {
-	char filename[SCAP_MAX_PATH_SIZE];
+	char filename[SCAP_MAX_PATH_SIZE + 8];
 	char netroot[SCAP_MAX_PATH_SIZE];
 	char err_buf[SCAP_LASTERR_SIZE];
 
@@ -1257,7 +1273,7 @@ int32_t scap_fd_scan_fd_dir(struct scap_linux_platform *linux_platform,
 	struct dirent *dir_entry_p;
 	int32_t res = SCAP_SUCCESS;
 	char fd_dir_name[SCAP_MAX_PATH_SIZE];
-	char f_name[SCAP_MAX_PATH_SIZE];
+	char f_name[SCAP_MAX_PATH_SIZE + 258];
 	struct stat sb;
 	uint64_t fd;
 	scap_fdinfo fdi = {};

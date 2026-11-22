@@ -132,7 +132,10 @@ public:
 		FLAGS_IN_BASELINE_RW = (1 << 11),
 		FLAGS_IN_BASELINE_OTHER = (1 << 12),
 		FLAGS_SOCKET_CONNECTED = (1 << 13),
-		FLAGS_IS_CLONED = (1 << 14),
+		// FLAGS_IS_CLONED = (1 << 14), // note: retired (fd tables are shared on fork
+		//                              // and copied on write; "still referenced by
+		//                              // another process" is now is_shared() on the
+		//                              // entry's table). Don't reuse the bit.
 		FLAGS_CONNECTION_PENDING = (1 << 15),
 		FLAGS_CONNECTION_FAILED = (1 << 16),
 		FLAGS_OVERLAY_UPPER = (1 << 17),
@@ -164,22 +167,11 @@ public:
 			c->m_fd = m_fd;
 			c->m_name = std::atomic_load(&m_name);
 			c->m_name_raw = std::atomic_load(&m_name_raw);
-			c->m_oldname = std::atomic_load(&m_oldname);
 		});
-		c->m_name_changed = m_name_changed;
 		return c;
 	}
 
 	inline write_guard_type write_guard() const { return write_guard_type(m_seq); }
-
-	inline void snapshot_oldname() {
-		write_guard_type g(m_seq);
-		std::atomic_store(&m_oldname, std::atomic_load(&m_name));
-	}
-
-	inline bool consume_name_changed() {
-		return m_name_changed.exchange(false, std::memory_order_relaxed);
-	}
 
 	// =====================================================================
 	// Scalar getters -- lock-free via load_relaxed
@@ -211,10 +203,6 @@ public:
 	}
 	inline std::string get_name_raw() const {
 		auto p = std::atomic_load(&m_name_raw);
-		return p ? *p : std::string{};
-	}
-	inline std::string get_oldname() const {
-		auto p = std::atomic_load(&m_oldname);
 		return p ? *p : std::string{};
 	}
 
@@ -293,13 +281,10 @@ public:
 
 	inline void set_name_inner(std::shared_ptr<const std::string> new_ptr) {
 		auto old = std::atomic_load(&m_name);
-		// Treat absent m_name like the pre-COW default empty string so we do not
-		// spuriously set name_changed on the first store of "".
 		static const std::string k_empty_name;
 		const std::string& old_name = old ? *old : k_empty_name;
 		if(old_name != *new_ptr) {
 			std::atomic_store(&m_name, std::move(new_ptr));
-			m_name_changed.store(true, std::memory_order_relaxed);
 		}
 	}
 
@@ -307,11 +292,6 @@ public:
 		auto new_ptr = std::make_shared<const std::string>(std::move(n));
 		write_guard_type g(m_seq);
 		std::atomic_store(&m_name_raw, std::move(new_ptr));
-	}
-	inline void set_oldname(std::string n) {
-		auto new_ptr = std::make_shared<const std::string>(std::move(n));
-		write_guard_type g(m_seq);
-		std::atomic_store(&m_oldname, std::move(new_ptr));
 	}
 
 	// =====================================================================
@@ -336,7 +316,7 @@ public:
 
 	char get_typechar() const;
 	const char* get_typestring() const;
-	std::string tostring_clean() const;
+	std::string tostring() const;
 
 	inline bool is_syslog() const {
 		auto p = std::atomic_load(&m_name);
@@ -420,9 +400,6 @@ public:
 	}
 	inline bool is_socket_failed() const {
 		return (load_relaxed(m_flags) & FLAGS_CONNECTION_FAILED) == FLAGS_CONNECTION_FAILED;
-	}
-	inline bool is_cloned() const {
-		return (load_relaxed(m_flags) & FLAGS_IS_CLONED) == FLAGS_IS_CLONED;
 	}
 	inline bool is_overlay_upper() const {
 		return (load_relaxed(m_flags) & FLAGS_OVERLAY_UPPER) == FLAGS_OVERLAY_UPPER;
@@ -520,10 +497,6 @@ public:
 		fetch_and_relaxed(m_flags, ~(uint32_t)(FLAGS_SOCKET_CONNECTED | FLAGS_CONNECTION_PENDING));
 		fetch_or_relaxed(m_flags, (uint32_t)FLAGS_CONNECTION_FAILED);
 	}
-	inline void set_is_cloned() {
-		write_guard_type g(m_seq);
-		fetch_or_relaxed(m_flags, (uint32_t)FLAGS_IS_CLONED);
-	}
 	inline void set_overlay_upper() {
 		write_guard_type g(m_seq);
 		fetch_or_relaxed(m_flags, (uint32_t)FLAGS_OVERLAY_UPPER);
@@ -542,6 +515,19 @@ public:
 	void add_filename(std::string_view fullpath);
 
 	void set_net_role_by_guessing(const sinsp_threadinfo& ptinfo, bool incoming);
+
+	// True if this entry describes the same fd state as `other`: same fd
+	// number, type, flags, identity and name, and (for sockets) the same
+	// tuple. Dynamic fields are not compared; callers deduplicating entries
+	// must exclude entries carrying dynamic field values.
+	//
+	// Virtual for the same reason clone() is: an event processor may build a
+	// subclass carrying extra data (see libsinsp::event_processor::build_fdinfo),
+	// and two entries differing only in that data are not interchangeable, so
+	// answering true for them would let a caller share one where two are needed.
+	// An override must chain to this implementation and compare its own state on
+	// top of it.
+	virtual bool content_equals(const sinsp_fdinfo_impl& other) const;
 
 	/*!
 	  \brief A static version of static_fields()
@@ -575,9 +561,6 @@ private:
 	// COW strings: reads via std::atomic_load, writes via std::atomic_store.
 	std::shared_ptr<const std::string> m_name;
 	std::shared_ptr<const std::string> m_name_raw;
-	std::shared_ptr<const std::string> m_oldname;
-
-	copyable_atomic_flag m_name_changed;
 
 public:
 	// Per-fdinfo seqlock for thread-safe access. Mutable so const methods can

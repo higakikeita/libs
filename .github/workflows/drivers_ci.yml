@@ -24,8 +24,8 @@ jobs:
       libscap: ${{ steps.filter.outputs.libscap }}
       libpman: ${{ steps.filter.outputs.libpman }}
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-    - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
       id: filter
       with:
         filters: |
@@ -50,7 +50,7 @@ jobs:
         # We need to skip each step because of https://github.com/orgs/community/discussions/9141.
         # This avoids having a skipped job whose name is not the resolved matrix name, like "test-scap-${{ matrix.arch }} 😆 (bundled_deps)"
         if: needs.paths-filter.outputs.driver == 'true' || needs.paths-filter.outputs.libscap == 'true' || needs.paths-filter.outputs.libpman == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -123,7 +123,7 @@ jobs:
     steps:
       - name: Checkout Libs ⤵️
         if: needs.paths-filter.outputs.driver == 'true' || needs.paths-filter.outputs.libscap == 'true' || needs.paths-filter.outputs.libpman == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -174,6 +174,11 @@ jobs:
   test-drivers-ppc64le:
     name: test-drivers-ppc64le 😁 (system_deps,custom node)
     runs-on: ubuntu-24.04
+    # The job runs on a single shared ppc64le machine: serialize the runs so that
+    # concurrent clones and builds cannot delete each other's source tree.
+    concurrency:
+      group: ${{ github.workflow }}-ppc64le-node
+      cancel-in-progress: false
     # Avoid running on forks since this job uses a private secret
     # not available on forks, leading to failures.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == 'falcosecurity/libs'
@@ -223,7 +228,7 @@ jobs:
     steps:
       - name: Checkout Libs ⤵️
         if: needs.paths-filter.outputs.driver == 'true' || needs.paths-filter.outputs.libscap == 'true' || needs.paths-filter.outputs.libpman == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -263,7 +268,7 @@ jobs:
           dnf install -y ca-certificates make automake gcc gcc-c++ kernel-devel clang git pkg-config autoconf libbpf-devel curl
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install cmake 🌊
         uses: ./.github/actions/install-cmake
@@ -279,7 +284,7 @@ jobs:
           cmake --build skeleton-build --target ProbeSkeleton --parallel $(nproc)
 
       - name: Upload skeleton
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bpf_probe_x86_64.skel.h
           path: skeleton-build/skel_dir/bpf_probe.skel.h
@@ -301,13 +306,13 @@ jobs:
           sudo update-alternatives --install /usr/bin/llc llc /usr/bin/llc-14 90
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install cmake 🌊
         uses: ./.github/actions/install-cmake
 
       - name: Download skeleton
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bpf_probe_x86_64.skel.h
           path: /tmp
@@ -324,6 +329,104 @@ jobs:
       - name: Build project
         run: |
           cmake --build build --target scap-open --parallel $(nproc)
+
+  # Build the matrix for `build-scap-open-w-zig`. The matrix doesn't contain s390x/ppc64le entries if the workflow run
+  # on forks, as the corresponding runners don't support unauthenticated usage.
+  # See: https://github.com/IBM/actionspz/blob/main/docs/FAQ.md#what-about-forked-repos.
+  build-matrix-for-build-scap-open-w-zig:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        name: Build matrix for `build-scap-open-w-zig`
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          base=$(jq -nc '[
+            {"arch": "amd64", "runner": "ubuntu-24.04",     "zig_target": "x86_64-linux-gnu.2.17",  "is_ibm_arch": "false", "use_bundled_libelf": "ON"},
+            {"arch": "arm64", "runner": "ubuntu-24.04-arm", "zig_target": "aarch64-linux-gnu.2.17", "is_ibm_arch": "false", "use_bundled_libelf": "ON"}
+          ]')
+          # note: glibc added upstream support for `ppc64le` on 2.19
+          ibm=$(jq -nc '[
+            {"arch": "s390x",   "runner": "ubuntu-24.04-s390x",   "zig_target": "s390x-linux-gnu.2.17",       "is_ibm_arch": "true", "use_bundled_libelf": "ON"},
+            {"arch": "ppc64le", "runner": "ubuntu-24.04-ppc64le", "zig_target": "powerpc64le-linux-gnu.2.19", "is_ibm_arch": "true", "use_bundled_libelf": "OFF"}
+          ]')
+          if [[ "$EVENT_NAME" == "push" || "$PR_HEAD_REPO" == "falcosecurity/libs" ]]; then
+            matrix=$(jq -nc --argjson a "$base" --argjson b "$ibm" '$a + $b')
+          else
+            matrix="$base"
+          fi
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  build-scap-open-w-zig:
+    name: build-scap-open-w-zig-${{ matrix.arch }} 🎯 (bundled_deps, glibc-check)
+    runs-on: ${{ matrix.runner }}
+    needs: [paths-filter, build-matrix-for-build-scap-open-w-zig]
+    env:
+      MUST_RUN: ${{ needs.paths-filter.outputs.driver == 'true' || needs.paths-filter.outputs.libscap == 'true' || needs.paths-filter.outputs.libpman == 'true' }}
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.build-matrix-for-build-scap-open-w-zig.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Checkout Libs ⤵️
+        if: env.MUST_RUN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install deps ⛓️ (non-IBM archs)
+        if: env.MUST_RUN == 'true' && matrix.is_ibm_arch == 'false'
+        run: |
+          sudo apt update
+          sudo apt install -y --no-install-recommends ca-certificates build-essential clang-14 llvm-14 git pkg-config autoconf automake libtool libelf-dev libcap-dev
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 90
+          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-14 90
+          sudo update-alternatives --install /usr/bin/llc llc /usr/bin/llc-14 90
+
+      - name: Install deps ⛓️ (IBM archs)
+        if: env.MUST_RUN == 'true' && matrix.is_ibm_arch == 'true'
+        run: |
+          sudo apt update
+          sudo apt install -y --no-install-recommends ca-certificates cmake build-essential git pkg-config autoconf automake libelf-dev libcap-dev clang llvm libtool
+
+      - name: Install cmake 🌊 (non-IBM archs)
+        if: env.MUST_RUN == 'true' && matrix.is_ibm_arch == 'false'
+        uses: ./.github/actions/install-cmake
+
+      - name: Install bpftool 🐝
+        if: env.MUST_RUN == 'true'
+        uses: ./.github/actions/install-bpftool
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Install zig
+        if: env.MUST_RUN == 'true'
+        uses: ./.github/actions/install-zig
+        with:
+          target: ${{ matrix.zig_target }}
+
+      - name: Build scap-open with zig 🏗️
+        if: env.MUST_RUN == 'true'
+        run: |
+          cmake -B build -S . \
+            -DUSE_BUNDLED_DEPS=ON \
+            -DBUILD_DRIVER=Off \
+            -DENABLE_ENGINE_KMOD=ON \
+            -DBUILD_LIBSCAP_MODERN_BPF=ON \
+            -DCREATE_TEST_TARGETS=Off \
+            -DENABLE_LIBSCAP_TESTS=Off \
+            -DCMAKE_TOOLCHAIN_FILE=$ZIG_TOOLCHAIN_FILE \
+            -DUSE_BUNDLED_LIBELF="${{ matrix.use_bundled_libelf }}"
+          cmake --build build --target scap-open --parallel $(nproc)
+
+      # Check the glibc versions linked to scap-open to make sure we are actually using the correct glibc version.
+      - name: Test zig build glibc version
+        if: env.MUST_RUN == 'true'
+        run: .github/check-glibc-version.sh build/libscap/examples/01-open/scap-open
 
   # Only runs on pull request since on master branch it is already triggered by pages CI.
   kernel-tests-dev:
@@ -345,13 +448,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Download X64 matrix
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: matrix_X64
           path: matrix_X64
 
       - name: Download ARM64 matrix
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: matrix_ARM64
           path: matrix_ARM64
@@ -371,7 +474,7 @@ jobs:
           echo ""
 
       - name: Upload PR info as artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v4
         with:
           name: pr-kernel-testing
           path: pr/

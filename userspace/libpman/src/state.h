@@ -41,6 +41,19 @@ limitations under the License.
 
 struct metrics_v2;
 
+#ifdef BPF_ITERATOR_SUPPORT
+
+// Store information about the support for `bpf_iter_link_info` or any of its members.
+struct bpf_iter_link_info_support_info {
+	// If true, the current kernel provides support for `bpf_iter_link_info` union.
+	bool is_available;
+	// If true, the current kernel provides support for the `task` member of `bpf_iter_link_info`
+	// (note: meaningful only if `is_available` is true).
+	bool is_task_filtering_supported;
+};
+
+#endif /* BPF_ITERATOR_SUPPORT */
+
 struct internal_state {
 	struct bpf_probe* skel;          /* bpf skeleton with all programs and maps. */
 	struct ring_buffer* rb_manager;  /* ring_buffer manager with all ring buffers. */
@@ -52,6 +65,9 @@ struct internal_state {
 	int16_t n_interesting_cpus;  /* according to userspace configuration we can consider only online
 	                    CPUs or all  available CPUs. */
 	bool allocate_online_only;   /* If true we allocate ring buffers only for online CPUs */
+	bool iterators_disabled; /* If true, BPF iterator support is disabled. This is true if the user
+	                            explicitly requested it or if the probe is not running in the root
+	                            PID namespace. */
 	uint32_t n_required_buffers; /* number of ring buffers we need to allocate */
 	uint16_t cpus_for_each_buffer;  /* Users want a ring buffer every `cpus_for_each_buffer` CPUs.
 	                                   Here 0 means that the user specified an absolute number for
@@ -76,6 +92,14 @@ struct internal_state {
 	size_t log_buf_size;      /* size of the log buffer */
 	falcosecurity_log_fn log_fn;
 
+	bool creat_ttm_unavailable; /* If true, the `creat` TOCTOU mitigation tracepoint is not
+	                                  available on this kernel/arch (e.g. ARM64). Set the first time
+	                                  `pman_enforce_sc_set()` sees ENOENT attaching it, so later
+	                               calls skip the doomed attach instead of retrying and re-logging.
+	                             */
+	bool open_ttm_unavailable;  /* Same as `creat_ttm_unavailable`, for the `open` TOCTOU
+	                                  mitigation tracepoint. */
+
 #ifdef BPF_ITERATOR_SUPPORT
 
 	/* BPF iterators section */
@@ -86,6 +110,18 @@ struct internal_state {
 	                                         gather tasks information */
 	bool is_task_files_dumping_supported; /* If true, use the corresponding BPF iterator program to
 	                                    gather task files information */
+	struct bpf_iter_link_info_support_info
+	        bpf_iter_link_info_supp_info; /* Store information about the support for
+	                                       * `bpf_iter_link_info` or any of its members. Used by
+	                                       * `pman_fetch_*()` APIs. `.is_available` is used to
+	                                       * determine if the BPF iterator attachment operation
+	                                       * provides support for passing filtering options.
+	                                       * `.is_task_filtering_supported` determines whether
+	                                       * in-kernel task filtering for BPF iterator programs is
+	                                       * available, and the kernel can perform the filtering: if
+	                                       * false, the support for operations that would require
+	                                       * task filtering is disabled.
+	                                       */
 
 #endif /* BPF_ITERATOR_SUPPORT */
 };

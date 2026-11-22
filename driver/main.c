@@ -1042,7 +1042,7 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 		}
 
 		ns = ns_of_pid(pid);
-		if(!pid) {
+		if(!ns) {
 			rcu_read_unlock();
 			ret = -EINVAL;
 			goto cleanup_ioctl;
@@ -2622,7 +2622,7 @@ static int scap_init(void) {
 	unsigned int cpu;
 	unsigned int num_cpus;
 	int ret;
-	int acrret = 0;
+	int acrret = -1;
 	int j;
 	int n_created_devices = 0;
 	struct device *device = NULL;

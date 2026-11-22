@@ -290,7 +290,8 @@ int32_t scap_modern_bpf__init(scap_t* handle, scap_open_args* oargs) {
 	                   params->buffer_bytes_dim,
 	                   params->buffers_num,
 	                   params->iters_num,
-	                   params->allocate_online_only)) {
+	                   params->allocate_online_only,
+	                   params->disable_iterators)) {
 		return scap_errprintf(handle->m_lasterr, 0, "unable to configure the libpman state.");
 	}
 
@@ -387,7 +388,7 @@ uint64_t scap_modern_bpf__get_schema_version(struct scap_engine_handle engine) {
 int32_t scap_modern_bpf__fetch_task(struct scap_engine_handle engine,
                                     const struct scap_fetch_callbacks* callbacks,
                                     const uint32_t tid,
-                                    scap_threadinfo** tinfo,
+                                    scap_threadinfo* tinfo,
                                     char* error) {
 	return pman_iter_fetch_task(callbacks, tid, tinfo, error);
 }

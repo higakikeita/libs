@@ -73,7 +73,7 @@ sinsp_evt::sinsp_evt():
         m_paramstr_storage(1024),
         m_resolved_paramstr_storage(1024),
         m_tinfo_ref(nullptr),
-        m_fdinfo_name_changed(false),
+        m_fdinfo_name_snapshot_valid(false),
         m_iosize(0),
         m_errorcode(0),
         m_rawbuf_str_len(0),
@@ -120,6 +120,27 @@ sinsp_threadinfo *sinsp_evt::get_thread_info() {
 
 	m_tinfo_ref = m_inspector->m_thread_manager->find_thread(m_pevt->tid, false);
 	return m_tinfo_ref.get();
+}
+
+void sinsp_evt::upgrade_fd_info_writable() {
+	// Re-fetch the event's fd through the writable lookup, which detaches a
+	// private copy if the entry is currently shared with other fd tables. The
+	// clone (if any) is attributed to this event's type.
+	//
+	// If the thread or the fd is gone we keep the existing (read-only) pointer
+	// instead of clearing it: callers have null-checked the fd earlier in the
+	// event and dereference what they get here unconditionally. Their write then
+	// lands on an entry that may still be shared, or that is no longer in the
+	// table -- i.e. it may leak into another table or be lost. That needs the fd
+	// to disappear between the read-only lookup in sinsp_parser::reset() and the
+	// first write in the same event, which no current path does.
+	if(!m_tinfo_ref || !m_fdinfo_ref) {
+		return;
+	}
+	std::shared_ptr<sinsp_fdinfo> writable = m_tinfo_ref->get_fd_mut(m_fdinfo_ref->get_fd_num());
+	if(writable != nullptr) {
+		m_fdinfo_ref = std::move(writable);
+	}
 }
 
 int64_t sinsp_evt::get_fd_num() const {
@@ -461,153 +482,20 @@ uint32_t binary_buffer_to_string(char *dst,
 	return k;
 }
 
-// `dst` and `src` must both be non-empty.
-static void strcpy_sanitized(std::vector<char> &dst, const std::string_view src) {
-	auto *dst_ptr = reinterpret_cast<unsigned char *>(&dst[0]);
-	const auto dst_size = dst.size();
-	ASSERT(dst_size > 0);
-
-	const auto *src_ptr = reinterpret_cast<const unsigned char *>(src.data());
-	const size_t src_size = src.size();
-	ASSERT(src_size > 0);
-
-	auto *capped_src_end = src_ptr + std::min(src_size, dst_size);
-
-	// Find the first sequence in source needing replacement. For valid strings, this is the only
-	// pass that runs (no replacement needed), and the flow immediately returns after copying the
-	// maximum allowed amount of bytes.
-	auto *scan_src_ptr = utf8_first_invalid_seq(src_ptr, capped_src_end);
-	if(scan_src_ptr == capped_src_end) {
-		size_t bytes_to_copy;
-		if(src_size < dst_size) {
-			bytes_to_copy = src_size;
-		} else {
-			// The source string must be truncated (`src_size >= dst_size`). Find the boundary of
-			// the last valid UTF-8 sequence in source (a valid UTF-8 sequence is guaranteed to
-			// exist, given `src_size > 0`).
-			auto *scan_ptr = capped_src_end - 1;
-			while(utf8_seq_len(scan_ptr, capped_src_end) < 0) {
-				scan_ptr--;
-			}
-			const auto last_valid_seq_off = capped_src_end - scan_ptr;
-			bytes_to_copy = dst_size - last_valid_seq_off;
-		}
-		memcpy(dst_ptr, src_ptr, bytes_to_copy);
-		dst_ptr[bytes_to_copy] = 0;
-		return;
+// Ensure `storage` has a size greater or equal than `size`.
+static void ensure_storage_size(std::vector<char> &storage, const size_t size) {
+	if(size > storage.size()) {
+		storage.resize(size);
 	}
-
-	// Copy the valid prefix (note: can be empty) in one shot.
-	size_t bytes_to_copy = scan_src_ptr - src_ptr;
-	memcpy(dst_ptr, src_ptr, bytes_to_copy);
-
-	// Process the remainder. The assumption here is that, at the beginning of each iteration, there
-	// is an invalid sequence in source that should result into a single replacement character into
-	// destination: this requires at least 3 bytes for the replacement character. Moreover, the
-	// destination must be NUL terminated, so the destination must have at least 4 bytes (i.e.:
-	// `dst_left_bytes >= 4`).
-	auto *scan_dst_ptr = dst_ptr + bytes_to_copy;
-	size_t dst_left_bytes = dst_size - bytes_to_copy;
-	while(scan_src_ptr < capped_src_end && dst_left_bytes >= 4) {
-		// Replace the invalid sequence at the beginning of each iteration with the replacement
-		// character.
-		const int seq_len = utf8_seq_len(scan_src_ptr, capped_src_end);
-		ASSERT(seq_len < 0);
-		memcpy(scan_dst_ptr, "\xEF\xBF\xBD", 3);
-		scan_dst_ptr += 3;
-		dst_left_bytes -= 3;
-		scan_src_ptr += -seq_len;
-
-		// Find the next valid block of UTF-8 characters to copy. Its size must not be greater than
-		// `min(src_left_bytes, dst_left_bytes - 1)`. (-1 accounts for the NUL terminator).
-		const size_t src_left_bytes = capped_src_end - scan_src_ptr;
-		const auto *end_ptr = scan_src_ptr + std::min(dst_left_bytes - 1, src_left_bytes);
-		const auto *next_invalid = utf8_first_invalid_seq(scan_src_ptr, end_ptr);
-		bytes_to_copy = next_invalid - scan_src_ptr;
-		if(bytes_to_copy > 0) {
-			memcpy(scan_dst_ptr, scan_src_ptr, bytes_to_copy);
-			scan_dst_ptr += bytes_to_copy;
-			dst_left_bytes -= bytes_to_copy;
-		}
-		scan_src_ptr = next_invalid;
-
-		// `utf8_first_invalid_seq` could have stopped before the end of source due to the cap to
-		// `dst_left_bytes - 1`. In this case, the following UTF-8 sequence could still be valid,
-		// but there is no space left in the destination, so break.
-		if(scan_src_ptr < capped_src_end && utf8_seq_len(scan_src_ptr, capped_src_end) > 0) {
-			break;
-		}
-	}
-	*scan_dst_ptr = 0;
 }
 
-int sinsp_evt::render_fd_json(Json::Value *ret,
-                              const int64_t fd,
-                              const char ** /*resolved_str*/,
-                              const param_fmt fmt) {
-	sinsp_threadinfo *tinfo = get_thread_info();
-	if(tinfo == nullptr) {
-		return 0;
-	}
-
-	if(fd >= 0) {
-		auto fdinfo = tinfo->get_fd(fd);
-		if(fdinfo) {
-			char tch = fdinfo->get_typechar();
-			char ipprotoch = 0;
-
-			auto ftype = fdinfo->get_type();
-			if(ftype == SCAP_FD_IPV4_SOCK || ftype == SCAP_FD_IPV6_SOCK ||
-			   ftype == SCAP_FD_IPV4_SERVSOCK || ftype == SCAP_FD_IPV6_SERVSOCK) {
-				scap_l4_proto l4p = fdinfo->get_l4proto();
-
-				switch(l4p) {
-				case SCAP_L4_TCP:
-					ipprotoch = 't';
-					break;
-				case SCAP_L4_UDP:
-					ipprotoch = 'u';
-					break;
-				case SCAP_L4_ICMP:
-					ipprotoch = 'i';
-					break;
-				case SCAP_L4_RAW:
-					ipprotoch = 'r';
-					break;
-				default:
-					break;
-				}
-			}
-
-			const char typestr[3] = {fmt & PF_SIMPLE ? static_cast<char>(0) : tch, ipprotoch, 0};
-
-			//
-			// Make sure we remove invalid characters from the resolved name
-			//
-			std::string sanitized_storage;
-			const std::string name = fdinfo->get_name();
-			const auto sanitized_name = sanitize_string(name, sanitized_storage);
-
-			(*ret)["typechar"] = typestr;
-			(*ret)["name"] = sanitized_name.data();
-		}
-	} else if(fd == PPM_AT_FDCWD) {
-		//
-		// `fd` can be AT_FDCWD on all *at syscalls
-		//
-		(*ret)["name"] = "AT_FDCWD";
-	} else {
-		//
-		// Resolve this as an errno
-		//
-		if(const std::string errstr(sinsp_utils::errno_to_str(static_cast<int32_t>(fd)));
-		   errstr != "") {
-			(*ret)["error"] = errstr;
-			return 0;
-		}
-	}
-
-	return 1;
+// Write `str` and a trailing '\0' to `storage`, ensuring data fits into storage.
+static void write_to_storage(std::vector<char> &storage, const std::string_view str) {
+	const auto str_len = str.length();
+	// `+ 1` account for trailing '\0'.
+	ensure_storage_size(storage, str_len + 1);
+	memcpy(storage.data(), str.data(), str_len);
+	storage.data()[str_len] = '\0';
 }
 
 char *sinsp_evt::render_fd(const int64_t fd, const char ** /*resolved_str*/, const param_fmt fmt) {
@@ -655,25 +543,15 @@ char *sinsp_evt::render_fd(const int64_t fd, const char ** /*resolved_str*/, con
 
 			char typestr[3] = {fmt & PF_SIMPLE ? static_cast<char>(0) : tch, ipprotoch, 0};
 
-			//
-			// Make sure we remove invalid characters from the resolved name
-			//
-			std::string sanitized_storage;
-			const std::string name = fdinfo->get_name();
-			const auto sanitized_name = sanitize_string(name, sanitized_storage);
-
-			//
-			// Make sure the string will fit
-			//
-			if(sanitized_name.size() >= m_resolved_paramstr_storage.size()) {
-				m_resolved_paramstr_storage.resize(sanitized_name.size() + 1);
-			}
-
+			// `+ 2` accounts for '<' and '>', `+1` accounts for trailing '\0' (see sprintf format).
+			const auto fdname = fdinfo->get_name();
+			const auto size_to_request = (sizeof(typestr) - 1) + 2 + fdname.size() + 1;
+			ensure_storage_size(m_resolved_paramstr_storage, size_to_request);
 			snprintf(&m_resolved_paramstr_storage[0],
 			         m_resolved_paramstr_storage.size(),
 			         "<%s>%s",
 			         typestr,
-			         sanitized_name.data());
+			         fdname.c_str());
 		}
 	} else if(fd == PPM_AT_FDCWD) {
 		//
@@ -734,11 +612,174 @@ std::string sinsp_evt::get_base_dir(const uint32_t id, sinsp_threadinfo *tinfo) 
 	return rel_path_base;
 }
 
+constexpr size_t MAX_UINT32_DEC_DIGITS = 10;
+constexpr size_t MAX_UINT64_HEX_DIGITS = 16;
+
+void sinsp_evt::write_sockaddr_param_to_storage(std::vector<char> &storage,
+                                                const sinsp_evt_param &param) const {
+	const auto param_data = reinterpret_cast<const uint8_t *>(param.data());
+	if(!sinsp_utils::is_sockaddr_valid(param)) {
+		if(param.empty()) {
+			write_to_storage(storage, "<NA>");
+			return;
+		}
+		ASSERT(false);
+		switch(*packed::generic_sockaddr::family(param_data)) {
+		case PPM_AF_UNIX:
+			write_to_storage(storage, "INVALID PATH");
+			break;
+		case PPM_AF_INET:
+			write_to_storage(storage, "INVALID IPv4");
+			break;
+		case PPM_AF_INET6:
+			write_to_storage(storage, "INVALID IPv6");
+			break;
+		default:
+			write_to_storage(storage, "INVALID SOCKADDR");
+			break;
+		}
+		return;
+	}
+
+	switch(const auto sock_family = *packed::generic_sockaddr::family(param_data); sock_family) {
+	case PPM_AF_UNIX: {
+		write_to_storage(storage, packed::un_sockaddr::dpath(param_data));
+	} break;
+	case PPM_AF_INET: {
+		ipv4serverinfo addr;
+		memcpy(&addr.m_ip, packed::in_sockaddr::ip(param_data), sizeof(addr.m_ip));
+		memcpy(&addr.m_port, packed::in_sockaddr::port(param_data), sizeof(addr.m_port));
+		addr.m_l4proto = m_fdinfo_ref != nullptr ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN;
+		const auto straddr =
+		        ipv4serveraddr_to_string(addr,
+		                                 m_inspector->is_hostname_and_port_resolution_enabled());
+		write_to_storage(storage, straddr);
+	} break;
+	case PPM_AF_INET6: {
+		ipv6serverinfo addr;
+		memcpy(addr.m_ip.m_b, packed::in6_sockaddr::ip(param_data), sizeof(addr.m_ip.m_b));
+		memcpy(&addr.m_port, packed::in6_sockaddr::port(param_data), sizeof(addr.m_port));
+		addr.m_l4proto = m_fdinfo_ref != nullptr ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN;
+		const auto straddr =
+		        ipv6serveraddr_to_string(addr,
+		                                 m_inspector->is_hostname_and_port_resolution_enabled());
+		write_to_storage(storage, straddr);
+	} break;
+	default:
+		snprintf(&storage[0], storage.size(), "family %d", sock_family);
+		break;
+	}
+}
+
+void sinsp_evt::write_socktuple_param_to_storage(std::vector<char> &storage,
+                                                 const sinsp_evt_param &param) const {
+	const auto param_data = reinterpret_cast<const uint8_t *>(param.data());
+	if(!sinsp_utils::is_socktuple_valid(param)) {
+		if(param.empty()) {
+			// todo(ekoops): replace "NULL" with "<NA>" once we get rid of this legacy NULL encoding
+			//   convention.
+			write_to_storage(storage, "NULL");
+			return;
+		}
+		ASSERT(false);
+		switch(*packed::generic_tuple::family(param_data)) {
+		case PPM_AF_UNIX:
+			write_to_storage(storage, "INVALID PATH");
+			break;
+		case PPM_AF_INET:
+			write_to_storage(storage, "INVALID IPv4");
+			break;
+		case PPM_AF_INET6:
+			write_to_storage(storage, "INVALID IPv6");
+			break;
+		default:
+			write_to_storage(storage, "INVALID SOCKTUPLE");
+			break;
+		}
+		return;
+	}
+
+	switch(const auto sock_family = *packed::generic_tuple::family(param_data); sock_family) {
+	case PPM_AF_UNIX: {
+		uint64_t src, dst;
+		memcpy(&src, packed::un_socktuple::source(param_data), sizeof(uint64_t));
+		memcpy(&dst, packed::un_socktuple::dest(param_data), sizeof(uint64_t));
+		const auto *path = packed::un_socktuple::dpath(param_data);
+		const auto path_len = reinterpret_cast<const char *>(param_data) + param.len() - path;
+		// `+ 3` accounts for `->` and a space ' ', `+ 1` accounts for trailing '\0' (see printf
+		// format below).
+		const auto size_to_request = MAX_UINT64_HEX_DIGITS * 2 + 3 + path_len + 1;
+		ensure_storage_size(storage, size_to_request);
+		snprintf(&storage[0], storage.size(), "%" PRIx64 "->%" PRIx64 " %s", src, dst, path);
+	} break;
+	case PPM_AF_INET: {
+		ipv4tuple addr;
+		memcpy(&addr.m_fields.m_sip, packed::in_socktuple::sip(param_data), sizeof(uint32_t));
+		memcpy(&addr.m_fields.m_sport, packed::in_socktuple::sport(param_data), sizeof(uint16_t));
+		memcpy(&addr.m_fields.m_dip, packed::in_socktuple::dip(param_data), sizeof(uint32_t));
+		memcpy(&addr.m_fields.m_dport, packed::in_socktuple::dport(param_data), sizeof(uint16_t));
+		addr.m_fields.m_l4proto = m_fdinfo_ref != nullptr ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN;
+		const auto straddr =
+		        ipv4tuple_to_string(addr, m_inspector->is_hostname_and_port_resolution_enabled());
+		write_to_storage(storage, straddr);
+	} break;
+	case PPM_AF_INET6: {
+		const auto *const sip = packed::in6_socktuple::sip(param_data);
+		const auto *const sport = packed::in6_socktuple::sport(param_data);
+		const auto *const dip = packed::in6_socktuple::dip(param_data);
+		const auto *const dport = packed::in6_socktuple::dport(param_data);
+		if(sinsp_utils::is_ipv4_mapped_ipv6(sip) && sinsp_utils::is_ipv4_mapped_ipv6(dip)) {
+			ipv4tuple addr;
+			const auto *const mapped_sip = packed::in6_socktuple::ipv4_mapped_sip(param_data);
+			const auto *const mapped_dip = packed::in6_socktuple::ipv4_mapped_dip(param_data);
+			memcpy(&addr.m_fields.m_sip, mapped_sip, sizeof(uint32_t));
+			memcpy(&addr.m_fields.m_sport, sport, sizeof(uint16_t));
+			memcpy(&addr.m_fields.m_dip, mapped_dip, sizeof(uint32_t));
+			memcpy(&addr.m_fields.m_dport, dport, sizeof(uint16_t));
+			addr.m_fields.m_l4proto =
+			        m_fdinfo_ref != nullptr ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN;
+			const auto straddr =
+			        ipv4tuple_to_string(addr,
+			                            m_inspector->is_hostname_and_port_resolution_enabled());
+			write_to_storage(storage, straddr);
+			return;
+		}
+
+		char srcstr[INET6_ADDRSTRLEN];
+		char dststr[INET6_ADDRSTRLEN];
+		if(!inet_ntop(AF_INET6, sip, srcstr, sizeof(srcstr)) ||
+		   !inet_ntop(AF_INET6, dip, dststr, sizeof(dststr))) {
+			ASSERT(false);
+			write_to_storage(storage, "INVALID IPv6");
+			return;
+		}
+		uint16_t src_port, dst_port;
+		memcpy(&src_port, sport, sizeof(src_port));
+		memcpy(&dst_port, dport, sizeof(dst_port));
+		snprintf(&storage[0],
+		         storage.size(),
+		         "%s:%s->%s:%s",
+		         srcstr,
+		         port_to_string(src_port,
+		                        m_fdinfo_ref != nullptr ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN,
+		                        m_inspector->is_hostname_and_port_resolution_enabled())
+		                 .c_str(),
+		         dststr,
+		         port_to_string(dst_port,
+		                        m_fdinfo_ref != nullptr ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN,
+		                        m_inspector->is_hostname_and_port_resolution_enabled())
+		                 .c_str());
+	} break;
+	default:
+		snprintf(&storage[0], storage.size(), "family %d", sock_family);
+		break;
+	}
+}
+
 const char *sinsp_evt::get_param_as_str(uint32_t id, const char **resolved_str, param_fmt fmt) {
 	char *prfmt = nullptr;
 	const ppm_param_info *param_info = nullptr;
 	std::string_view s;
-	uint8_t sockfamily;
 
 	//
 	// Make sure the params are actually loaded
@@ -916,25 +957,16 @@ const char *sinsp_evt::get_param_as_str(uint32_t id, const char **resolved_str, 
 	case PT_FSPATH:
 	case PT_FSRELPATH: {
 		const auto path = param->as<std::string_view>();
-		if(path.length() + 1 > m_paramstr_storage.size()) {
-			m_paramstr_storage.resize(path.length() + 1);
-		}
-
-		strcpy_sanitized(m_paramstr_storage, path);
+		write_to_storage(m_paramstr_storage, path);
 
 		if(auto *tinfo = get_thread_info()) {
 			if(path != "<NA>") {
 				std::string cwd = get_base_dir(id, tinfo);
-
-				if(path.length() + cwd.length() + 1 >= m_resolved_paramstr_storage.size()) {
-					m_resolved_paramstr_storage.resize(path.length() + cwd.length() + 2, 0);
-				}
-
 				if(path.empty() || std::filesystem::path(path).is_absolute()) {
-					m_resolved_paramstr_storage[0] = 0;
+					write_to_storage(m_resolved_paramstr_storage, "");
 				} else {
 					std::string concatenated_path = sinsp_utils::concatenate_paths(cwd, path);
-					strcpy_sanitized(m_resolved_paramstr_storage, concatenated_path);
+					write_to_storage(m_resolved_paramstr_storage, concatenated_path);
 				}
 			}
 		} else {
@@ -980,158 +1012,11 @@ const char *sinsp_evt::get_param_as_str(uint32_t id, const char **resolved_str, 
 		}
 	} break;
 	case PT_SOCKADDR: {
-		auto param_data = param->data();
-		auto param_len = param->len();
-		sockfamily = param_data[0];
-		if(sockfamily == PPM_AF_UNIX) {
-			ASSERT(param->len() > 1);
-
-			//
-			// Sanitize the file string.
-			//
-			std::string sanitized_path_storage;
-			const auto sanitized_path = sanitize_string(param_data + 1, sanitized_path_storage);
-			snprintf(&m_paramstr_storage[0],
-			         m_paramstr_storage.size(),
-			         "%s",
-			         sanitized_path.data());
-		} else if(sockfamily == PPM_AF_INET) {
-			if(param_len == 1 + 4 + 2) {
-				ipv4serverinfo addr;
-				memcpy(&addr.m_ip, param_data + 1, sizeof(addr.m_ip));
-				memcpy(&addr.m_port, param_data + 5, sizeof(addr.m_port));
-				addr.m_l4proto = (m_fdinfo_ref) ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN;
-				std::string straddr = ipv4serveraddr_to_string(
-				        addr,
-				        m_inspector->is_hostname_and_port_resolution_enabled());
-				snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "%s", straddr.c_str());
-			} else {
-				ASSERT(false);
-				snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "INVALID IPv4");
-			}
-		} else if(sockfamily == PPM_AF_INET6) {
-			if(param_len == 1 + 16 + 2) {
-				ipv6serverinfo addr;
-				memcpy(addr.m_ip.m_b, param_data + 1, sizeof(addr.m_ip.m_b));
-				memcpy(&addr.m_port, param_data + 17, sizeof(addr.m_port));
-				addr.m_l4proto = (m_fdinfo_ref) ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN;
-				std::string straddr = ipv6serveraddr_to_string(
-				        addr,
-				        m_inspector->is_hostname_and_port_resolution_enabled());
-				snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "%s", straddr.c_str());
-			} else {
-				ASSERT(false);
-				snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "INVALID IPv6");
-			}
-		} else {
-			snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "family %d", sockfamily);
-		}
-		break;
-	}
+		write_sockaddr_param_to_storage(m_paramstr_storage, *param);
+	} break;
 	case PT_SOCKTUPLE: {
-		const auto param_data = reinterpret_cast<const uint8_t *>(param->data());
-		const auto param_len = param->len();
-		sockfamily = param_data[0];
-		if(sockfamily == PPM_AF_INET) {
-			if(param_len == 1 + 4 + 2 + 4 + 2) {
-				ipv4tuple addr;
-				memcpy(&addr.m_fields.m_sip, param_data + 1, sizeof(uint32_t));
-				memcpy(&addr.m_fields.m_sport, param_data + 5, sizeof(uint16_t));
-				memcpy(&addr.m_fields.m_dip, param_data + 7, sizeof(uint32_t));
-				memcpy(&addr.m_fields.m_dport, param_data + 11, sizeof(uint16_t));
-				addr.m_fields.m_l4proto =
-				        (m_fdinfo_ref) ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN;
-				std::string straddr =
-				        ipv4tuple_to_string(addr,
-				                            m_inspector->is_hostname_and_port_resolution_enabled());
-				snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "%s", straddr.c_str());
-			} else {
-				ASSERT(false);
-				snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "INVALID IPv4");
-			}
-		} else if(sockfamily == PPM_AF_INET6) {
-			if(param_len == 1 + 16 + 2 + 16 + 2) {
-				const uint8_t *sip6 = param_data + 1;
-				const uint8_t *dip6 = param_data + 19;
-				const uint8_t *sip = param_data + 13;
-				const uint8_t *dip = param_data + 31;
-
-				if(sinsp_utils::is_ipv4_mapped_ipv6(sip6) &&
-				   sinsp_utils::is_ipv4_mapped_ipv6(dip6)) {
-					ipv4tuple addr;
-					memcpy(&addr.m_fields.m_sip, sip, sizeof(uint32_t));
-					memcpy(&addr.m_fields.m_sport, param_data + 17, sizeof(uint16_t));
-					memcpy(&addr.m_fields.m_dip, dip, sizeof(uint32_t));
-					memcpy(&addr.m_fields.m_dport, param_data + 35, sizeof(uint16_t));
-					addr.m_fields.m_l4proto =
-					        (m_fdinfo_ref) ? m_fdinfo_ref->get_l4proto() : SCAP_L4_UNKNOWN;
-					std::string straddr = ipv4tuple_to_string(
-					        addr,
-					        m_inspector->is_hostname_and_port_resolution_enabled());
-
-					snprintf(&m_paramstr_storage[0],
-					         m_paramstr_storage.size(),
-					         "%s",
-					         straddr.c_str());
-					break;
-				} else {
-					char srcstr[INET6_ADDRSTRLEN];
-					char dststr[INET6_ADDRSTRLEN];
-					if(inet_ntop(AF_INET6, sip6, srcstr, sizeof(srcstr)) &&
-					   inet_ntop(AF_INET6, dip6, dststr, sizeof(dststr))) {
-						uint16_t srcport, dstport;
-						memcpy(&srcport, param_data + 17, sizeof(srcport));
-						memcpy(&dstport, param_data + 35, sizeof(dstport));
-						snprintf(&m_paramstr_storage[0],
-						         m_paramstr_storage.size(),
-						         "%s:%s->%s:%s",
-						         srcstr,
-						         port_to_string(
-						                 srcport,
-						                 (m_fdinfo_ref) ? m_fdinfo_ref->get_l4proto()
-						                                : SCAP_L4_UNKNOWN,
-						                 m_inspector->is_hostname_and_port_resolution_enabled())
-						                 .c_str(),
-						         dststr,
-						         port_to_string(
-						                 dstport,
-						                 (m_fdinfo_ref != NULL) ? m_fdinfo_ref->get_l4proto()
-						                                        : SCAP_L4_UNKNOWN,
-						                 m_inspector->is_hostname_and_port_resolution_enabled())
-						                 .c_str());
-						break;
-					}
-				}
-			}
-
-			ASSERT(false);
-			snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "INVALID IPv6");
-		} else if(sockfamily == PPM_AF_UNIX) {
-			ASSERT(param->len() > 17);
-
-			//
-			// Sanitize the file string.
-			//
-			std::string sanitized_path_storage;
-			const auto sanitized_path =
-			        sanitize_string(reinterpret_cast<const char *>(param_data) + 17,
-			                        sanitized_path_storage);
-
-			uint64_t src, dst;
-			memcpy(&src, param_data + 1, sizeof(uint64_t));
-			memcpy(&dst, param_data + 9, sizeof(uint64_t));
-
-			snprintf(&m_paramstr_storage[0],
-			         m_paramstr_storage.size(),
-			         "%" PRIx64 "->%" PRIx64 " %s",
-			         src,
-			         dst,
-			         sanitized_path.data());
-		} else {
-			snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "family %d", sockfamily);
-		}
-		break;
-	}
+		write_socktuple_param_to_storage(m_paramstr_storage, *param);
+	} break;
 	case PT_FDLIST: {
 		uint32_t j = 0;
 		sinsp_threadinfo *tinfo = get_thread_info();
@@ -1360,11 +1245,10 @@ const char *sinsp_evt::get_param_as_str(uint32_t id, const char **resolved_str, 
 		break;
 	case PT_UID: {
 		if(const auto val = param->as<uint32_t>(); val < std::numeric_limits<uint32_t>::max()) {
-			// Note: we want to resolve user given the uid
-			// from the event.
-			// Eg: for setuid() the requested uid is not
-			// the threadinfo one yet;
-			// therefore we cannot directly use tinfo->m_user here.
+			// Note: we want to resolve user given the uid from the event.
+			// Eg: for setuid() the requested uid is not the threadinfo one yet; therefore we cannot
+			// directly use tinfo->m_user here.
+			ensure_storage_size(m_paramstr_storage, MAX_UINT32_DEC_DIGITS + 1);
 			snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "%d", val);
 			sinsp_threadinfo *tinfo = get_thread_info();
 			bool resolved = false;
@@ -1375,32 +1259,27 @@ const char *sinsp_evt::get_param_as_str(uint32_t id, const char **resolved_str, 
 				        val,
 				        [this](const scap_userinfo &user_info) {
 					        if(user_info.name[0] != 0) {
-						        strcpy_sanitized(m_resolved_paramstr_storage, user_info.name);
+						        write_to_storage(m_resolved_paramstr_storage, user_info.name);
 					        } else {
-						        snprintf(&m_resolved_paramstr_storage[0],
-						                 m_resolved_paramstr_storage.size(),
-						                 "<NA>");
+						        write_to_storage(m_resolved_paramstr_storage, "<NA>");
 					        }
 				        });
 			}
 			if(!resolved) {
-				snprintf(&m_resolved_paramstr_storage[0],
-				         m_resolved_paramstr_storage.size(),
-				         "<NA>");
+				write_to_storage(m_resolved_paramstr_storage, "<NA>");
 			}
 		} else {
-			snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "-1");
-			snprintf(&m_resolved_paramstr_storage[0], m_resolved_paramstr_storage.size(), "<NONE>");
+			write_to_storage(m_paramstr_storage, "-1");
+			write_to_storage(m_resolved_paramstr_storage, "<NONE>");
 		}
 		break;
 	}
 	case PT_GID: {
 		if(const auto val = param->as<uint32_t>(); val < std::numeric_limits<uint32_t>::max()) {
-			// Note: we want to resolve group given the gid
-			// from the event.
-			// Eg: for setgid() the requested gid is not
-			// the threadinfo one yet;
-			// therefore we cannot directly use tinfo->m_group here.
+			// Note: we want to resolve group given the gid from the event.
+			// Eg: for setgid() the requested gid is not the threadinfo one yet; therefore we cannot
+			// directly use tinfo->m_group here.
+			ensure_storage_size(m_paramstr_storage, MAX_UINT32_DEC_DIGITS + 1);
 			snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "%d", val);
 			sinsp_threadinfo *tinfo = get_thread_info();
 			bool resolved = false;
@@ -1411,22 +1290,18 @@ const char *sinsp_evt::get_param_as_str(uint32_t id, const char **resolved_str, 
 				        val,
 				        [this](const scap_groupinfo &group_info) {
 					        if(group_info.name[0] != 0) {
-						        strcpy_sanitized(m_resolved_paramstr_storage, group_info.name);
+						        write_to_storage(m_resolved_paramstr_storage, group_info.name);
 					        } else {
-						        snprintf(&m_resolved_paramstr_storage[0],
-						                 m_resolved_paramstr_storage.size(),
-						                 "<NA>");
+						        write_to_storage(m_resolved_paramstr_storage, "<NA>");
 					        }
 				        });
 			}
 			if(!resolved) {
-				snprintf(&m_resolved_paramstr_storage[0],
-				         m_resolved_paramstr_storage.size(),
-				         "<NA>");
+				write_to_storage(m_resolved_paramstr_storage, "<NA>");
 			}
 		} else {
-			snprintf(&m_paramstr_storage[0], m_paramstr_storage.size(), "-1");
-			snprintf(&m_resolved_paramstr_storage[0], m_resolved_paramstr_storage.size(), "<NONE>");
+			write_to_storage(m_paramstr_storage, "-1");
+			write_to_storage(m_resolved_paramstr_storage, "<NONE>");
 		}
 		break;
 	}

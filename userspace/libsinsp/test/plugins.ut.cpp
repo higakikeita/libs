@@ -374,6 +374,20 @@ TEST_F(sinsp_with_test_input, plugin_custom_source) {
 	ASSERT_FALSE(field_has_value(evt, "fd.name", filterlist));
 	ASSERT_EQ(get_field_as_string(evt, "evt.pluginname", filterlist), src_pl->name());
 	ASSERT_EQ(get_field_as_string(evt, "sample.hello", filterlist), "hello world");
+	ASSERT_FALSE(field_has_value(evt, "sample.absent", filterlist));
+
+	static bool extraction_failure_logged;
+	extraction_failure_logged = false;
+	libsinsp_logger()->add_callback_log([](std::string&& message, sinsp_logger::severity severity) {
+		extraction_failure_logged = true;
+		EXPECT_EQ(severity, sinsp_logger::SEV_ERROR);
+		EXPECT_NE(message.find("sample_plugin_extract: field extraction failed: test extraction "
+		                       "failure"),
+		          std::string::npos);
+	});
+	ASSERT_FALSE(field_has_value(evt, "sample.failure", filterlist));
+	libsinsp_logger()->remove_callback_log();
+	ASSERT_TRUE(extraction_failure_logged);
 
 	auto offset = get_value_offset_start(evt, "sample.hello", filterlist, 0);
 	ASSERT_EQ(offset, PLUGIN_EVENT_PAYLOAD_OFFSET);
@@ -673,9 +687,9 @@ TEST_F(sinsp_with_test_input, plugin_syscall_async) {
 	std::unique_ptr<sinsp_filter_check> chk(
 	        filterlist.new_filter_check_from_fldname("evt.type", &m_inspector, false));
 	ASSERT_GT(chk->parse_field_name("evt.type", true, false), 0);
-	ASSERT_NO_THROW(chk->add_filter_value("openat", strlen("openat") + 1, 0));
-	ASSERT_NO_THROW(chk->add_filter_value("sampleticker", strlen("sampleticker") + 1, 1));
-	ASSERT_ANY_THROW(chk->add_filter_value("badname", strlen("badname") + 1, 2));
+	ASSERT_NO_THROW(chk->add_filter_value("openat", strlen("openat"), 0));
+	ASSERT_NO_THROW(chk->add_filter_value("sampleticker", strlen("sampleticker"), 1));
+	ASSERT_ANY_THROW(chk->add_filter_value("badname", strlen("badname"), 2));
 
 	// we will not use the test scap engine here, but open the no-driver instead
 	uint64_t count = 0;
@@ -920,7 +934,7 @@ TEST_F(sinsp_with_test_input, plugin_subtables) {
 	ASSERT_EQ(table->entries_count(), 1);
 
 	// obtain a pointer to the subtable (check typing too)
-	auto subtable_acc = field->second.new_accessor().into<libsinsp::state::base_table*>();
+	auto subtable_acc = field->second.into<libsinsp::state::base_table*>();
 	auto subtable = dynamic_cast<sinsp_fdtable*>(entry->read_field(subtable_acc));
 	ASSERT_NE(subtable, nullptr);
 	ASSERT_EQ(subtable->name(), std::string("file_descriptors"));
@@ -932,13 +946,13 @@ TEST_F(sinsp_with_test_input, plugin_subtables) {
 	ASSERT_EQ(sfield->second.readonly(), false);
 	ASSERT_EQ(sfield->second.name(), "pid");
 	ASSERT_EQ(sfield->second.type_id(), SS_PLUGIN_ST_INT64);
-	auto sfieldacc = sfield->second.new_accessor().into<int64_t>();
+	auto sfieldacc = sfield->second.into<int64_t>();
 
 	// get an accessor to a dynamic field declared by the plugin
 	ASSERT_EQ(subtable->dynamic_fields()->fields().size(), 1);
 	auto dfield = subtable->dynamic_fields()->fields().find("custom");
 	ASSERT_NE(dfield, subtable->dynamic_fields()->fields().end());
-	auto dfieldacc = dfield->second.new_accessor().into<std::string>();
+	auto dfieldacc = dfield->second->into<std::string>();
 
 	// step #0: the plugin should populate the fdtable
 	add_event_advance_ts(increasing_ts(),
@@ -1029,7 +1043,7 @@ TEST_F(sinsp_with_test_input, plugin_subtables_array) {
 	ASSERT_EQ(table->entries_count(), 1);
 
 	// obtain a pointer to the subtable (check typing too)
-	auto subtable_acc = field->second.new_accessor().into<libsinsp::state::base_table*>();
+	auto subtable_acc = field->second.into<libsinsp::state::base_table*>();
 	auto subtable =
 	        dynamic_cast<libsinsp::state::stl_container_table_adapter<std::vector<std::string>>*>(
 	                entry->read_field(subtable_acc));
@@ -1038,12 +1052,11 @@ TEST_F(sinsp_with_test_input, plugin_subtables_array) {
 	ASSERT_EQ(subtable->entries_count(), 0);
 
 	// get an accessor to a dynamic field representing the array's values
-	auto dfield = subtable->get_field("value", SS_PLUGIN_ST_STRING);
-	// ASSERT_EQ(dfield->second.readonly(), false);
-	// ASSERT_EQ(dfield->second.valid(), true);
-	// ASSERT_EQ(dfield->second.name(), "value");
-	auto dfieldacc = dfield.into<std::string>();
-	ASSERT_NE(dfieldacc, nullptr);
+	const auto& dfield = subtable->get_field("value", SS_PLUGIN_ST_STRING);
+	// ASSERT_EQ(dfield.readonly(), false);
+	// ASSERT_EQ(dfield.valid(), true);
+	// ASSERT_EQ(dfield.name(), "value");
+	auto dfieldacc = dfield.as<std::string>();
 
 	// step #0: the plugin should populate the fdtable
 	add_event_advance_ts(increasing_ts(),
@@ -1132,27 +1145,25 @@ TEST_F(sinsp_with_test_input, plugin_subtables_array_pair) {
 	ASSERT_EQ(table->entries_count(), 1);
 
 	// obtain a pointer to the subtable (check typing too)
-	auto subtable_acc = field->second.new_accessor().into<libsinsp::state::base_table*>();
+	auto subtable_acc = field->second.into<libsinsp::state::base_table*>();
 	auto subtable = dynamic_cast<libsinsp::state::stl_container_table_adapter<
-	        std::vector<std::pair<std::string, std::string>>,
-	        libsinsp::state::pair_table_entry_adapter<std::string, std::string>>*>(
-	        entry->read_field(subtable_acc));
+	        std::vector<std::pair<std::string, std::string>>>*>(entry->read_field(subtable_acc));
 	ASSERT_NE(subtable, nullptr);
 	ASSERT_EQ(subtable->name(), std::string("cgroups"));
 	ASSERT_EQ(subtable->entries_count(), 0);
 	// get an accessor to a dynamic field representing the array's values
 
-	auto dfield_first = subtable->get_field("first", SS_PLUGIN_ST_STRING);
-	// ASSERT_EQ(dfield_first->second.readonly(), false);
-	// ASSERT_EQ(dfield_first->second.valid(), true);
-	// ASSERT_EQ(dfield_first->second.name(), "first");
-	auto dfield_first_acc = dfield_first.into<std::string>();
+	const auto& dfield_first = subtable->get_field("first", SS_PLUGIN_ST_STRING);
+	// ASSERT_EQ(dfield_first.readonly(), false);
+	// ASSERT_EQ(dfield_first.valid(), true);
+	// ASSERT_EQ(dfield_first.name(), "first");
+	auto dfield_first_acc = dfield_first.as<std::string>();
 
-	auto dfield_second = subtable->get_field("second", SS_PLUGIN_ST_STRING);
-	// ASSERT_EQ(dfield_second->second.readonly(), false);
-	// ASSERT_EQ(dfield_second->second.valid(), true);
-	// ASSERT_EQ(dfield_second->second.name(), "second");
-	auto dfield_second_acc = dfield_second.into<std::string>();
+	const auto& dfield_second = subtable->get_field("second", SS_PLUGIN_ST_STRING);
+	// ASSERT_EQ(dfield_second.readonly(), false);
+	// ASSERT_EQ(dfield_second.valid(), true);
+	// ASSERT_EQ(dfield_second.name(), "second");
+	auto dfield_second_acc = dfield_second.as<std::string>();
 
 	// step #0: the plugin should populate the fdtable
 	add_event_advance_ts(increasing_ts(),

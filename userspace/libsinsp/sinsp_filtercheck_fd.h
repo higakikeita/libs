@@ -83,9 +83,8 @@ public:
 protected:
 	bool extract_nocache(sinsp_evt*,
 	                     std::vector<extract_value_t>& values,
-	                     std::vector<extract_offset_t>*,
-	                     bool sanitize_strings = true) override;
-	uint8_t* extract_single(sinsp_evt*, uint32_t* len, bool sanitize_strings = true) override;
+	                     std::vector<extract_offset_t>*) override;
+	uint8_t* extract_single(sinsp_evt*, uint32_t* len) override;
 	bool compare_nocache(sinsp_evt*) override;
 
 private:
@@ -99,7 +98,7 @@ private:
 	bool compare_domain(sinsp_evt* evt);
 
 	sinsp_threadinfo* m_tinfo;
-	std::shared_ptr<sinsp_fdinfo> m_fdinfo;
+	std::shared_ptr<const sinsp_fdinfo> m_fdinfo;
 	sinsp_sockinfo m_sockinfo_cache;
 	std::string m_tstr;
 	uint8_t m_tcstr[2];

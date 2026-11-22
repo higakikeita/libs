@@ -421,6 +421,7 @@ void parse_CLI_options(int argc, char** argv) {
 			modern_bpf_params.buffers_num = DEFAULT_BUFFERS_NUM;
 			modern_bpf_params.iters_num = DEFAULT_ITERS_NUM;
 			modern_bpf_params.allocate_online_only = true;
+			modern_bpf_params.disable_iterators = false;
 			oargs.engine_params = &modern_bpf_params;
 		}
 #endif

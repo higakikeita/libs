@@ -21,6 +21,7 @@ limitations under the License.
 #include <limits.h>
 #endif
 #include <stdio.h>
+#include <inttypes.h>
 #include <libscap/strl.h>
 #include <libsinsp/sinsp_int.h>
 #include <libscap/scap-int.h>
@@ -60,7 +61,20 @@ sinsp_threadinfo_impl<SyncPolicy>::get_static_fields() {
 	// todo(jasondellaluce): support missing fields that are vectors, maps, or sub-tables
 	DEFINE_STATIC_FIELD(ret, self, m_tid, "tid");
 	DEFINE_STATIC_FIELD(ret, self, m_pid, "pid");
-	DEFINE_STATIC_FIELD(ret, self, m_ptid, "ptid");
+	libsinsp::state::define_static_field<int64_t>(
+	        ret,
+	        "ptid",
+	        [](const void* in, size_t) -> libsinsp::state::borrowed_state_data {
+		        auto c = static_cast<const self*>(in);
+		        return libsinsp::state::borrowed_state_data::from<SS_PLUGIN_ST_INT64, int64_t>(
+		                c->get_ptid());
+	        },
+	        [](void* in, size_t, const libsinsp::state::borrowed_state_data& in_data) {
+		        auto c = static_cast<self*>(in);
+		        int64_t ptid;
+		        in_data.copy_to<SS_PLUGIN_ST_INT64, int64_t>(ptid);
+		        c->set_ptid(ptid);
+	        });
 	DEFINE_STATIC_FIELD(ret, self, m_reaper_tid, "reaper_tid");
 	DEFINE_STATIC_FIELD(ret, self, m_sid, "sid");
 
@@ -143,7 +157,7 @@ sinsp_threadinfo_impl<SyncPolicy>::get_static_fields() {
 		        auto c = static_cast<const self*>(in);
 		        return libsinsp::state::borrowed_state_data::
 		                from<SS_PLUGIN_ST_TABLE, const libsinsp::state::base_table*>(
-		                        &c->m_env_table_adapter);
+		                        &c->get_main_thread_or_self()->m_env_table_adapter);
 	        },
 	        [](void*, size_t, const libsinsp::state::borrowed_state_data&) {
 		        throw sinsp_exception("attempt to write to read-only static struct field: env");
@@ -163,7 +177,19 @@ sinsp_threadinfo_impl<SyncPolicy>::get_static_fields() {
 	        },
 	        true);
 	DEFINE_STATIC_FIELD(ret, self, m_flags, "flags");
-	DEFINE_STATIC_FIELD(ret, self, m_fdlimit, "fd_limit");
+	libsinsp::state::define_static_field<int64_t>(
+	        ret,
+	        "fd_limit",
+	        [](const void* in, size_t) -> libsinsp::state::borrowed_state_data {
+		        auto c = static_cast<const self*>(in);
+		        return libsinsp::state::borrowed_state_data::from<SS_PLUGIN_ST_INT64, int64_t>(
+		                c->get_main_thread_or_self()->m_fdlimit);
+	        },
+	        [](void* in, size_t, const libsinsp::state::borrowed_state_data& in_data) {
+		        auto c = static_cast<self*>(in);
+		        in_data.copy_to<SS_PLUGIN_ST_INT64, int64_t>(
+		                c->get_main_thread_or_self()->m_fdlimit);
+	        });
 	DEFINE_STATIC_FIELD(ret, self, m_uid, "uid");
 	DEFINE_STATIC_FIELD(ret, self, m_gid, "gid");
 	DEFINE_STATIC_FIELD(ret, self, m_loginuid, "loginuid");
@@ -213,13 +239,12 @@ sinsp_threadinfo_impl<SyncPolicy>::get_static_fields() {
 	        [](const void* in, size_t) -> libsinsp::state::borrowed_state_data {
 		        auto c = static_cast<const self*>(in);
 		        static thread_local std::shared_ptr<const std::string> s_cwd_cache;
-		        s_cwd_cache = std::atomic_load(&c->m_cwd);
+		        s_cwd_cache = std::atomic_load(&c->get_main_thread_or_self()->m_cwd);
 		        return libsinsp::state::borrowed_state_data::from<SS_PLUGIN_ST_STRING>(
 		                s_cwd_cache ? *s_cwd_cache : s_empty);
 	        },
 	        READONLY_WRITER_LAMBDA("cwd"),
 	        true);
-	// m_parent_loop_detected
 	return ret;
 }
 
@@ -235,7 +260,6 @@ void sinsp_threadinfo_impl<SyncPolicy>::init() {
 	m_loginuid = 0xffffffff;
 	set_lastevent_data_validity(false);
 	m_reaper_tid = -1;
-	m_not_expired_children = 0;
 	set_lastevent_type((uint16_t)-1);
 	set_lastevent_ts(0);
 	set_prevevent_ts(0);
@@ -255,7 +279,7 @@ void sinsp_threadinfo_impl<SyncPolicy>::init() {
 	m_pidns_init_start_ts = 0;
 	set_lastevent_fd(0);
 	set_last_event_data(nullptr);
-	m_parent_loop_detected = false;
+	store_relaxed(m_removed, false);
 	m_tty = 0;
 	m_cap_inheritable = 0;
 	m_cap_permitted = 0;
@@ -456,7 +480,6 @@ void sinsp_threadinfo_impl<SyncPolicy>::init(const scap_threadinfo& pinfo,
 
 	/* We cannot obtain the reaper_tid from a /proc scan */
 	m_reaper_tid = -1;
-	m_not_expired_children = 0;
 
 	set_args(pinfo.args, pinfo.args_len);
 	if(is_main_thread()) {
@@ -843,7 +866,7 @@ template<typename SyncPolicy>
 std::shared_ptr<sinsp_fdinfo> sinsp_threadinfo_impl<SyncPolicy>::add_fd(
         int64_t fd,
         std::shared_ptr<sinsp_fdinfo>&& fdinfo) {
-	sinsp_fdtable* fd_table_ptr = get_fd_table();
+	auto* fd_table_ptr = get_fd_table_mut();
 	if(fd_table_ptr == NULL) {
 		return nullptr;
 	}
@@ -856,7 +879,7 @@ std::shared_ptr<sinsp_fdinfo> sinsp_threadinfo_impl<SyncPolicy>::add_fd(
 
 template<typename SyncPolicy>
 void sinsp_threadinfo_impl<SyncPolicy>::remove_fd(int64_t fd) {
-	sinsp_fdtable* fd_table_ptr = get_fd_table();
+	auto* fd_table_ptr = get_fd_table_mut();
 	if(fd_table_ptr == NULL) {
 		return;
 	}
@@ -865,7 +888,7 @@ void sinsp_threadinfo_impl<SyncPolicy>::remove_fd(int64_t fd) {
 
 template<typename SyncPolicy>
 bool sinsp_threadinfo_impl<SyncPolicy>::loop_fds(sinsp_fdtable::fdtable_const_visitor_t visitor) {
-	sinsp_fdtable* fdt = get_fd_table();
+	const auto* fdt = get_fd_table();
 	if(fdt == NULL) {
 		return false;
 	}
@@ -1052,65 +1075,87 @@ bool sinsp_threadinfo_impl<SyncPolicy>::get_cgroup(const std::string& subsys,
 	return false;
 }
 
-template<typename SyncPolicy>
-void sinsp_threadinfo_impl<SyncPolicy>::report_thread_loop(
-        const sinsp_threadinfo_impl& looping_thread) {
-	// Note we only log a loop once for a given main thread, to avoid flooding logs.
-	if(!m_parent_loop_detected) {
-		libsinsp_logger()->log(std::string("Loop in parent thread state detected for pid ") +
-		                               std::to_string(m_pid) +
-		                               ". stopped at tid= " + std::to_string(looping_thread.m_tid) +
-		                               " ptid=" + std::to_string(looping_thread.m_ptid),
-		                       sinsp_logger::SEV_WARNING);
-		m_parent_loop_detected = true;
+namespace {
+
+using thread_ptr_t = std::shared_ptr<sinsp_threadinfo>;
+
+/* Return the thread that a link to `tid` in the live `group` points to. This is that thread
+ * while it is alive, or else the first live thread of the group. A dead thread keeps its children
+ * until it is removed. If the group has no live thread, the link stays on the dead thread.
+ */
+thread_ptr_t thread_in_group(const thread_group_info& group, int64_t tid) {
+	thread_ptr_t named;
+	thread_ptr_t first_alive;
+	for(const auto& thread_weak : group.get_thread_list()) {
+		/* Use only threads of this group, so that the next hop follows the link of this group */
+		auto thread = thread_weak.lock();
+		if(thread == nullptr || thread->get_tginfo().get() != &group) {
+			continue;
+		}
+		if(thread->m_tid == tid) {
+			if(!thread->is_dead()) {
+				return thread;
+			}
+			named = thread;
+		} else if(first_alive == nullptr && !thread->is_dead()) {
+			first_alive = thread;
+		}
 	}
+	if(named != nullptr && !named->is_removed()) {
+		return named;
+	}
+	if(first_alive != nullptr) {
+		return first_alive;
+	}
+	return named;
 }
 
-/* We should never call this method if we don't have children to reparent
- * if we want to save some clock cycles
+/* Return where a link to `tid` in `group` points to. This is the group if it is alive, or else
+ * its reaper, and so on through dead reapers. It is nullptr if a dead group has no reaper. Each
+ * step follows a parent link, so the search ends.
  */
+thread_ptr_t resolve_parent(std::shared_ptr<thread_group_info> group, int64_t tid) {
+	while(group != nullptr) {
+		if(!group->is_dead()) {
+			return thread_in_group(*group, tid);
+		}
+		tid = group->get_parent_tid();
+		group = group->get_parent();
+	}
+	return nullptr;
+}
+
+}  // namespace
+
 template<typename SyncPolicy>
-void sinsp_threadinfo_impl<SyncPolicy>::assign_children_to_reaper(sinsp_threadinfo_impl* reaper) {
-	if(get_children_count() == 0) {
-		return;
+std::shared_ptr<sinsp_threadinfo_impl<SyncPolicy>>
+sinsp_threadinfo_impl<SyncPolicy>::get_linked_parent() const {
+	auto tginfo = get_tginfo();
+	if(tginfo == nullptr) {
+		return nullptr;
 	}
+	return resolve_parent(tginfo->get_parent(), tginfo->get_parent_tid());
+}
 
-	if(reaper == this) {
-		throw sinsp_exception("the current process is reaper of itself, this should never happen!");
+template<typename SyncPolicy>
+int64_t sinsp_threadinfo_impl<SyncPolicy>::get_ptid() const {
+	auto tginfo = get_tginfo();
+	if(tginfo == nullptr) {
+		return load_relaxed(m_ptid);
 	}
-
-	if(reaper == nullptr) {
-		std::unique_lock lock(m_children_mutex);
-		auto it = m_children.begin();
-		while(it != m_children.end()) {
-			if(!it->expired()) {
-				it->lock()->set_ptid(0);
-			}
-			it = m_children.erase(it);
-		}
-		m_not_expired_children = 0;
-		return;
+	if(tginfo->get_parent() == nullptr) {
+		return tginfo->get_parent_tid();
 	}
+	auto parent = get_linked_parent();
+	return parent != nullptr ? parent->m_tid : 0;
+}
 
-	/* Lock both mutexes in canonical order (by tid) to prevent lock-order inversion
-	 * when different events reparent in opposite order (e.g. A→reaper B and B→reaper A).
-	 */
-	sinsp_threadinfo_impl* first = (m_tid < reaper->m_tid) ? this : reaper;
-	sinsp_threadinfo_impl* second = (m_tid < reaper->m_tid) ? reaper : this;
-	std::unique_lock lock1(first->m_children_mutex);
-	std::unique_lock lock2(second->m_children_mutex);
-
-	auto it = m_children.begin();
-	while(it != m_children.end()) {
-		if(!it->expired()) {
-			std::shared_ptr<sinsp_threadinfo_impl> c = it->lock();
-			reaper->m_children.push_front(c);
-			c->set_ptid(reaper->m_tid);
-			reaper->m_not_expired_children++;
-		}
-		it = m_children.erase(it);
+template<typename SyncPolicy>
+void sinsp_threadinfo_impl<SyncPolicy>::set_ptid(int64_t ptid) {
+	if(get_tginfo() != nullptr) {
+		throw sinsp_exception("the ptid of a thread in the process tree is read-only");
 	}
-	m_not_expired_children = 0;
+	store_relaxed(m_ptid, ptid);
 }
 
 template<typename SyncPolicy>
@@ -1147,44 +1192,43 @@ void sinsp_threadinfo_impl<SyncPolicy>::populate_args(std::string& args,
 }
 
 template<typename SyncPolicy>
-std::string sinsp_threadinfo_impl<SyncPolicy>::get_path_for_dir_fd(int64_t dir_fd) {
-	auto dir_fdinfo = get_fd(dir_fd);
-	auto dir_name = dir_fdinfo ? dir_fdinfo->get_name() : std::string{};
-	if(!dir_fdinfo || dir_name.empty()) {
-#ifndef _WIN32  // we will have to implement this for Windows
-		// Sad day; we don't have the directory in the tinfo's fd cache.
-		// Must manually look it up so we can resolve filenames correctly.
-		char proc_path[PATH_MAX];
-		char dirfd_path[PATH_MAX];
-		int ret;
-		snprintf(proc_path,
-		         sizeof(proc_path),
-		         "%s/proc/%lld/fd/%lld",
-		         scap_get_host_root(),
-		         (long long)m_pid,
-		         (long long)dir_fd);
-
-		ret = readlink(proc_path, dirfd_path, sizeof(dirfd_path) - 1);
-		if(ret < 0) {
-			libsinsp_logger()->log("Unable to determine path for file descriptor.",
-			                       sinsp_logger::SEV_INFO);
-			return "";
+std::string sinsp_threadinfo_impl<SyncPolicy>::get_path_for_dir_fd(const int64_t dir_fd) {
+	if(const auto dir_fdinfo = get_fd(dir_fd); dir_fdinfo) {
+		auto name = dir_fdinfo->get_name();
+		if(!name.empty()) {
+			return name.back() == '/' ? name : name + '/';
 		}
-		dirfd_path[ret] = '\0';
-
-		std::string copied_name;
-		copied_name.reserve(ret + 1);
-		copied_name.append(dirfd_path);
-		copied_name.append("/");
-		std::string sanitized_name_storage;
-		const auto sanitized_name = sanitize_string(copied_name, sanitized_name_storage);
-		if(sanitized_name.data() == copied_name.data()) {
-			return copied_name;
-		}
-		return sanitized_name_storage;
-#endif
 	}
-	return dir_name;
+
+	// Sad day; we don't have the directory in the tinfo's fd cache.
+	// Must manually look it up so we can resolve filenames correctly.
+#ifdef _WIN32
+	return "";  // We will have to implement this for Windows.
+#else
+	char dir_fd_path[PATH_MAX + 1];  // +1 accounts for trailing '/' that will be added.
+	// Pass `PATH_MAX` to leave room for '/'.
+	size_t dir_fd_path_len = 0;
+	if(scap_get_file_path(m_params->scap_plat,
+	                      get_pid(),
+	                      dir_fd,
+	                      dir_fd_path,
+	                      PATH_MAX,
+	                      &dir_fd_path_len,
+	                      m_params->scap_plat_lasterr) != SCAP_SUCCESS) {
+		libsinsp_logger()->format(sinsp_logger::SEV_INFO,
+		                          "Unable to determine path for file descriptor %" PRId64
+		                          " (pid: %" PRId64 "): %s",
+		                          dir_fd,
+		                          get_pid(),
+		                          m_params->scap_plat_lasterr);
+		return "";
+	}
+	if(dir_fd_path_len > 0 && dir_fd_path[dir_fd_path_len - 1] != '/') {
+		dir_fd_path[dir_fd_path_len] = '/';
+		dir_fd_path_len++;  // +1 account for trailing '/'.
+	}
+	return {dir_fd_path, dir_fd_path_len};
+#endif /* _WIN32 */
 }
 
 template<typename SyncPolicy>

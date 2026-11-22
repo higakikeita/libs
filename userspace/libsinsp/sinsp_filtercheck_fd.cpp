@@ -429,8 +429,7 @@ bool sinsp_filter_check_fd::extract_fdname_from_event(sinsp_evt *evt, bool fd_na
 
 bool sinsp_filter_check_fd::extract_nocache(sinsp_evt *evt,
                                             std::vector<extract_value_t> &values,
-                                            std::vector<extract_offset_t> *,
-                                            bool sanitize_strings) {
+                                            std::vector<extract_offset_t> *) {
 	values.clear();
 
 	if(!extract_fd(evt)) {
@@ -480,12 +479,10 @@ bool sinsp_filter_check_fd::extract_nocache(sinsp_evt *evt,
 		return true;
 	}
 
-	return sinsp_filter_check::extract_nocache(evt, values, nullptr, sanitize_strings);
+	return sinsp_filter_check::extract_nocache(evt, values, nullptr);
 }
 
-uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
-                                               uint32_t *len,
-                                               bool sanitize_strings) {
+uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt, uint32_t *len) {
 	*len = 0;
 	ASSERT(evt);
 
@@ -526,7 +523,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 			m_tstr = container_id + ':' + m_tstr;
 		}
 
-		return extract_single_string(m_tstr, len, sanitize_strings);
+		return extract_single_string(m_tstr, len);
 		break;
 	case TYPE_FDTYPES:
 	case TYPE_FDTYPE:
@@ -534,7 +531,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 			return NULL;
 		} else {
 			const char *typestr = m_fdinfo->get_typestring();
-			return extract_single_cstring(typestr, len, sanitize_strings);
+			return extract_single_cstring(typestr, len);
 		}
 		break;
 	case TYPE_DIRECTORY:
@@ -572,7 +569,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 			m_tstr = container_id + ':' + m_tstr;
 		}
 
-		return extract_single_string(m_tstr, len, sanitize_strings);
+		return extract_single_string(m_tstr, len);
 	} break;
 	case TYPE_FILENAME: {
 		if(m_fdinfo == NULL) {
@@ -584,10 +581,6 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 		}
 
 		m_tstr = m_fdinfo->get_name();
-		if(sanitize_strings) {
-			std::string storage;
-			m_tstr = std::string(sanitize_string(m_tstr, storage));
-		}
 
 		size_t pos = m_tstr.rfind('/');
 		if(pos != string::npos) {
@@ -598,7 +591,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 			m_tstr = "/";
 		}
 
-		return extract_single_string(m_tstr, len, sanitize_strings);
+		return extract_single_string(m_tstr, len);
 	} break;
 	case TYPE_FDTYPECHAR:
 		*len = 1;
@@ -649,7 +642,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 		}
 
 		if(!m_tstr.empty()) {
-			return extract_single_string(m_tstr, len, sanitize_strings);
+			return extract_single_string(m_tstr, len);
 		}
 	} break;
 	case TYPE_SNET:
@@ -705,7 +698,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 		}
 
 		if(!m_tstr.empty()) {
-			return extract_single_string(m_tstr, len, sanitize_strings);
+			return extract_single_string(m_tstr, len);
 		}
 	} break;
 	case TYPE_LNET:
@@ -829,7 +822,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 			}
 
 			if(!m_tstr.empty()) {
-				return extract_single_string(m_tstr, len, sanitize_strings);
+				return extract_single_string(m_tstr, len);
 			}
 		}
 	}
@@ -874,7 +867,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 			                        m_inspector->is_hostname_and_port_resolution_enabled());
 		}
 
-		return extract_single_string(m_tstr, len, sanitize_strings);
+		return extract_single_string(m_tstr, len);
 	} break;
 	case TYPE_SERVERPORT: {
 		if(m_fdinfo == NULL) {
@@ -941,7 +934,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 			                        m_inspector->is_hostname_and_port_resolution_enabled());
 		}
 
-		return extract_single_string(m_tstr, len, sanitize_strings);
+		return extract_single_string(m_tstr, len);
 	} break;
 	case TYPE_LPORT:
 	case TYPE_RPORT: {
@@ -1067,7 +1060,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 		m_tstr = port_to_string(nport,
 		                        this->m_fdinfo->get_l4proto(),
 		                        m_inspector->is_hostname_and_port_resolution_enabled());
-		return extract_single_string(m_tstr, len, sanitize_strings);
+		return extract_single_string(m_tstr, len);
 	} break;
 
 	case TYPE_L4PROTO: {
@@ -1095,7 +1088,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 			break;
 		}
 
-		return extract_single_string(m_tstr, len, sanitize_strings);
+		return extract_single_string(m_tstr, len);
 	} break;
 	case TYPE_IS_SERVER: {
 		if(m_fdinfo == NULL) {
@@ -1130,10 +1123,10 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 		if(ftype == SCAP_FD_IPV4_SOCK || ftype == SCAP_FD_IPV6_SOCK ||
 		   ftype == SCAP_FD_IPV4_SERVSOCK || ftype == SCAP_FD_IPV6_SERVSOCK) {
 			m_tstr = "ip";
-			return extract_single_string(m_tstr, len, sanitize_strings);
+			return extract_single_string(m_tstr, len);
 		} else if(ftype == SCAP_FD_UNIX_SOCK) {
 			m_tstr = "unix";
-			return extract_single_string(m_tstr, len, sanitize_strings);
+			return extract_single_string(m_tstr, len);
 		} else {
 			return NULL;
 		}
@@ -1144,7 +1137,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 		}
 
 		m_tstr = to_string(m_tinfo->m_tid) + to_string(m_tinfo->get_lastevent_fd());
-		return extract_single_string(m_tstr, len, sanitize_strings);
+		return extract_single_string(m_tstr, len);
 	} break;
 	case TYPE_IS_CONNECTED: {
 		if(m_fdinfo == NULL) {
@@ -1208,7 +1201,7 @@ uint8_t *sinsp_filter_check_fd::extract_single(sinsp_evt *evt,
 			m_tstr = m_fdinfo->get_name_raw();
 		}
 		remove_duplicate_path_separators(m_tstr);
-		return extract_single_string(m_tstr, len, sanitize_strings);
+		return extract_single_string(m_tstr, len);
 	} break;
 	case TYPE_FDUPPER: {
 		if(m_fdinfo == NULL) {
@@ -1247,13 +1240,25 @@ bool sinsp_filter_check_fd::compare_ip(sinsp_evt *evt) {
 		scap_fd_type evt_type = m_fdinfo->get_type();
 		if(evt_type == SCAP_FD_IPV4_SOCK) {
 			if(m_cmp.op == CO_EQ || m_cmp.op == CO_IN) {
-				if(compare_rhs(m_cmp, PT_IPV4ADDR, &m_sockinfo_cache.m_ipv4info.m_fields.m_sip) ||
-				   compare_rhs(m_cmp, PT_IPV4ADDR, &m_sockinfo_cache.m_ipv4info.m_fields.m_dip)) {
+				if(compare_rhs(m_cmp,
+				               PT_IPV4ADDR,
+				               &m_sockinfo_cache.m_ipv4info.m_fields.m_sip,
+				               sizeof(m_sockinfo_cache.m_ipv4info.m_fields.m_sip)) ||
+				   compare_rhs(m_cmp,
+				               PT_IPV4ADDR,
+				               &m_sockinfo_cache.m_ipv4info.m_fields.m_dip,
+				               sizeof(m_sockinfo_cache.m_ipv4info.m_fields.m_dip))) {
 					return true;
 				}
 			} else if(m_cmp.op == CO_NE) {
-				if(compare_rhs(m_cmp, PT_IPV4ADDR, &m_sockinfo_cache.m_ipv4info.m_fields.m_sip) &&
-				   compare_rhs(m_cmp, PT_IPV4ADDR, &m_sockinfo_cache.m_ipv4info.m_fields.m_dip)) {
+				if(compare_rhs(m_cmp,
+				               PT_IPV4ADDR,
+				               &m_sockinfo_cache.m_ipv4info.m_fields.m_sip,
+				               sizeof(m_sockinfo_cache.m_ipv4info.m_fields.m_sip)) &&
+				   compare_rhs(m_cmp,
+				               PT_IPV4ADDR,
+				               &m_sockinfo_cache.m_ipv4info.m_fields.m_dip,
+				               sizeof(m_sockinfo_cache.m_ipv4info.m_fields.m_dip))) {
 					return true;
 				}
 			} else {
@@ -1262,20 +1267,35 @@ bool sinsp_filter_check_fd::compare_ip(sinsp_evt *evt) {
 			}
 		} else if(evt_type == SCAP_FD_IPV4_SERVSOCK) {
 			if(m_cmp.op == CO_EQ || m_cmp.op == CO_NE || m_cmp.op == CO_IN) {
-				return compare_rhs(m_cmp, PT_IPV4ADDR, &m_sockinfo_cache.m_ipv4serverinfo.m_ip);
+				return compare_rhs(m_cmp,
+				                   PT_IPV4ADDR,
+				                   &m_sockinfo_cache.m_ipv4serverinfo.m_ip,
+				                   sizeof(m_sockinfo_cache.m_ipv4serverinfo.m_ip));
 			} else {
 				throw sinsp_exception(
 				        "filter error: IP filter only supports '=' and '!=' operators");
 			}
 		} else if(evt_type == SCAP_FD_IPV6_SOCK) {
 			if(m_cmp.op == CO_EQ || m_cmp.op == CO_IN) {
-				if(compare_rhs(m_cmp, PT_IPV6ADDR, &m_sockinfo_cache.m_ipv6info.m_fields.m_sip) ||
-				   compare_rhs(m_cmp, PT_IPV6ADDR, &m_sockinfo_cache.m_ipv6info.m_fields.m_dip)) {
+				if(compare_rhs(m_cmp,
+				               PT_IPV6ADDR,
+				               &m_sockinfo_cache.m_ipv6info.m_fields.m_sip,
+				               sizeof(m_sockinfo_cache.m_ipv6info.m_fields.m_sip)) ||
+				   compare_rhs(m_cmp,
+				               PT_IPV6ADDR,
+				               &m_sockinfo_cache.m_ipv6info.m_fields.m_dip,
+				               sizeof(m_sockinfo_cache.m_ipv6info.m_fields.m_dip))) {
 					return true;
 				}
 			} else if(m_cmp.op == CO_NE) {
-				if(compare_rhs(m_cmp, PT_IPV6ADDR, &m_sockinfo_cache.m_ipv6info.m_fields.m_sip) &&
-				   compare_rhs(m_cmp, PT_IPV6ADDR, &m_sockinfo_cache.m_ipv6info.m_fields.m_dip)) {
+				if(compare_rhs(m_cmp,
+				               PT_IPV6ADDR,
+				               &m_sockinfo_cache.m_ipv6info.m_fields.m_sip,
+				               sizeof(m_sockinfo_cache.m_ipv6info.m_fields.m_sip)) &&
+				   compare_rhs(m_cmp,
+				               PT_IPV6ADDR,
+				               &m_sockinfo_cache.m_ipv6info.m_fields.m_dip,
+				               sizeof(m_sockinfo_cache.m_ipv6info.m_fields.m_dip))) {
 					return true;
 				}
 			} else {
@@ -1284,7 +1304,10 @@ bool sinsp_filter_check_fd::compare_ip(sinsp_evt *evt) {
 			}
 		} else if(evt_type == SCAP_FD_IPV6_SERVSOCK) {
 			if(m_cmp.op == CO_EQ || m_cmp.op == CO_NE || m_cmp.op == CO_IN) {
-				return compare_rhs(m_cmp, PT_IPV6ADDR, &m_sockinfo_cache.m_ipv6serverinfo.m_ip);
+				return compare_rhs(m_cmp,
+				                   PT_IPV6ADDR,
+				                   &m_sockinfo_cache.m_ipv6serverinfo.m_ip,
+				                   sizeof(m_sockinfo_cache.m_ipv6serverinfo.m_ip));
 			} else {
 				throw sinsp_exception(
 				        "filter error: IP filter only supports '=' and '!=' operators");
@@ -1378,8 +1401,8 @@ bool sinsp_filter_check_fd::compare_port(sinsp_evt *evt) {
 			return true;
 		}
 
-		uint16_t *sport;
-		uint16_t *dport;
+		const uint16_t *sport;
+		const uint16_t *dport;
 		scap_fd_type evt_type = m_fdinfo->get_type();
 
 		if(evt_type == SCAP_FD_IPV4_SOCK) {
@@ -1465,7 +1488,7 @@ bool sinsp_filter_check_fd::compare_domain(sinsp_evt *evt) {
 			return false;
 		}
 
-		uint32_t *addr;
+		const uint32_t *addr;
 		if(m_field_id == TYPE_CLIENTIP_NAME) {
 			if(evt_type == SCAP_FD_IPV4_SOCK) {
 				addr = &m_sockinfo_cache.m_ipv4info.m_fields.m_sip;
@@ -1604,7 +1627,7 @@ bool sinsp_filter_check_fd::compare_nocache(sinsp_evt *evt) {
 	} else if(m_field_id == TYPE_CLIENTIP_NAME || m_field_id == TYPE_SERVERIP_NAME ||
 	          m_field_id == TYPE_LIP_NAME || m_field_id == TYPE_RIP_NAME) {
 		m_extracted_values.clear();
-		if(!extract(evt, m_extracted_values, false)) {
+		if(!extract(evt, m_extracted_values)) {
 			return compare_domain(evt);
 		}
 		auto ftype = sinsp_filter_check::get_transformed_field_info()->m_type;

@@ -33,6 +33,8 @@ limitations under the License.
 #include <libscap/strerror.h>
 #include <libscap/scap-int.h>
 
+#include <unordered_set>
+
 #ifndef _WIN32
 #include <unistd.h>
 #include <poll.h>
@@ -176,7 +178,9 @@ sinsp::sinsp(bool with_metrics):
                 sinsp_threadinfo::ctor_params{m_network_interfaces,
                                               m_fdinfo_factory,
                                               m_fdtable_factory,
-                                              m_thread_manager_dyn_fields})},
+                                              m_thread_manager_dyn_fields,
+                                              m_platform,
+                                              m_platform_lasterr})},
         m_threadinfo_factory{
                 m_threadinfo_ctor_params,
                 m_external_event_processor,
@@ -369,6 +373,13 @@ void sinsp::init() {
 	m_thread_manager->fix_sockets_coming_from_proc(m_hostname_and_port_resolution_enabled);
 
 	//
+	// Share content-identical fd entries between the scanned tables:
+	// fork-inherited fds appear once per process in /proc, so the scan
+	// materializes duplicates the live fork path no longer creates.
+	//
+	m_thread_manager->deduplicate_fd_tables();
+
+	//
 	// Load state table API field accessors and tables
 	//
 	try {
@@ -438,6 +449,7 @@ void sinsp::try_open_common(scap_open_args* oargs,
 			scap_close(m_h);
 			m_h = nullptr;
 		}
+		m_mode = SINSP_MODE_NONE;
 		throw;
 	}
 }
@@ -561,6 +573,7 @@ void sinsp::mark_ppm_sc_of_interest(ppm_sc_code ppm_sc, bool enable) {
 	}
 }
 
+#if defined(HAS_ENGINE_KMOD) || defined(HAS_ENGINE_MODERN_BPF)
 static void fill_ppm_sc_of_interest(scap_open_args* oargs,
                                     const libsinsp::events::set<ppm_sc_code>& ppm_sc_of_interest) {
 	for(int i = 0; i < PPM_SC_MAX; i++) {
@@ -572,6 +585,7 @@ static void fill_ppm_sc_of_interest(scap_open_args* oargs,
 		}
 	}
 }
+#endif
 
 void sinsp::open_kmod(unsigned long driver_buffer_bytes_dim,
                       const libsinsp::events::set<ppm_sc_code>& ppm_sc_of_interest) {
@@ -718,7 +732,8 @@ void sinsp::open_modern_bpf(unsigned long driver_buffer_bytes_dim,
                             double buffers_num,
                             int iters_num,
                             bool online_only,
-                            const libsinsp::events::set<ppm_sc_code>& ppm_sc_of_interest) {
+                            const libsinsp::events::set<ppm_sc_code>& ppm_sc_of_interest,
+                            bool disable_iterators) {
 #ifdef HAS_ENGINE_MODERN_BPF
 	scap_open_args oargs{};
 
@@ -731,6 +746,7 @@ void sinsp::open_modern_bpf(unsigned long driver_buffer_bytes_dim,
 	params.buffers_num = buffers_num;
 	params.iters_num = iters_num;
 	params.allocate_online_only = online_only;
+	params.disable_iterators = disable_iterators;
 	oargs.engine_params = &params;
 
 	scap_platform* platform = scap_linux_alloc_platform({::on_proc_table_refresh_start,
@@ -780,6 +796,25 @@ void sinsp::open_test_input(scap_test_input_data* data, sinsp_mode_t mode) {
 	set_get_procs_cpu_from_driver(false);
 #else
 	throw sinsp_exception("TEST_INPUT engine is not supported in this build");
+#endif
+}
+
+void sinsp::open_raw_block(uint8_t** buffer_ptr, uint64_t* buffer_size_ptr) {
+#ifdef HAS_ENGINE_RAW_BLOCK
+	scap_open_args oargs{};
+	scap_raw_block_engine_params params;
+	params.buffer_ptr = buffer_ptr;
+	params.buffer_size_ptr = buffer_size_ptr;
+
+	scap_platform* platform = scap_raw_block_alloc_platform({::on_proc_table_refresh_start,
+	                                                         ::on_proc_table_refresh_end,
+	                                                         ::on_new_entry_from_proc,
+	                                                         this});
+	params.platform = platform;
+	oargs.engine_params = &params;
+	try_open_common(&oargs, &scap_raw_block_engine, platform, SINSP_MODE_CAPTURE);
+#else
+	throw sinsp_exception("RAW_BLOCK engine is not supported in this build");
 #endif
 }
 
@@ -1750,26 +1785,39 @@ void sinsp::stop_capture() {
 		print_capture_stats(sinsp_logger::SEV_DEBUG);
 	}
 
-	/* Print the number of threads and fds in our tables */
+	/* Print the number of threads and fds in our tables. The unique count bills
+	 * each distinct fd entry once, however many tables reference it, so the gap
+	 * to the logical count is what copy-on-write sharing saves. Entry identity
+	 * rather than contents identity, because a table that has been written to
+	 * once has its own map while still referencing shared entries. */
 	uint64_t thread_cnt = 0;
 	uint64_t fd_cnt = 0;
-	m_thread_manager->loop_threads([&thread_cnt, &fd_cnt](const auto& tinfo) {
+	uint64_t unique_fd_cnt = 0;
+	std::unordered_set<const void*> seen_entries;
+	m_thread_manager->loop_threads([&](const sinsp_threadinfo& tinfo) {
 		thread_cnt++;
 
 		/* Only main threads have an associated fdtable */
 		if(tinfo.is_main_thread()) {
-			auto fdtable_ptr = tinfo.get_fd_table();
+			const auto* fdtable_ptr = tinfo.get_fd_table();
 			if(fdtable_ptr != nullptr) {
 				fd_cnt += fdtable_ptr->size();
+				fdtable_ptr->const_loop([&](int64_t, const sinsp_fdinfo& fdinfo) {
+					if(seen_entries.insert(&fdinfo).second) {
+						unique_fd_cnt++;
+					}
+					return true;
+				});
 			}
 		}
 		return true;
 	});
 	libsinsp_logger()->format(sinsp_logger::SEV_DEBUG,
 	                          "total threads in the table:%" PRIu64
-	                          ", total fds in all threads:%" PRIu64 "\n",
+	                          ", total fds in all threads:%" PRIu64 " (%" PRIu64 " unique)\n",
 	                          thread_cnt,
-	                          fd_cnt);
+	                          fd_cnt,
+	                          unique_fd_cnt);
 }
 
 void sinsp::start_capture() {

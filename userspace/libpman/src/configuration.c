@@ -17,6 +17,8 @@ limitations under the License.
 */
 
 #include "state.h"
+#include "support_probing.h"
+
 #include <sys/resource.h>
 #include <linux/limits.h>
 #include <sys/utsname.h>
@@ -62,6 +64,16 @@ static int libbpf_print(enum libbpf_print_level level, const char *format, va_li
 	return rc;
 }
 
+static void clear_iter_state() {
+	g_state.n_max_iters = 0;
+	__atomic_store_n(&g_state.n_encountered_iters, 0, __ATOMIC_SEQ_CST);
+#ifdef BPF_ITERATOR_SUPPORT
+	g_state.is_tasks_dumping_supported = false;
+	g_state.is_task_files_dumping_supported = false;
+	memset(&g_state.bpf_iter_link_info_supp_info, 0, sizeof(g_state.bpf_iter_link_info_supp_info));
+#endif /* BPF_ITERATOR_SUPPORT */
+}
+
 /* Clear global state. */
 static void clear_state() {
 	g_state.skel = NULL;
@@ -71,6 +83,7 @@ static void clear_state() {
 	g_state.n_possible_cpus = 0;
 	g_state.n_interesting_cpus = 0;
 	g_state.allocate_online_only = false;
+	g_state.iterators_disabled = false;
 	g_state.n_required_buffers = 0;
 	g_state.cpus_for_each_buffer = 0;
 	g_state.ringbuf_pos = 0;
@@ -94,30 +107,50 @@ static void clear_state() {
 	g_state.log_buf = NULL;
 	g_state.log_buf_size = 0;
 
-#ifdef BPF_ITERATOR_SUPPORT
-
-	/* BPF iterators section */
-	g_state.n_max_iters = 0;
-	__atomic_store_n(&g_state.n_encountered_iters, 0, __ATOMIC_SEQ_CST);
-	g_state.is_tasks_dumping_supported = false;
-	g_state.is_task_files_dumping_supported = false;
-
-#endif /* BPF_ITERATOR_SUPPORT */
+	clear_iter_state();
 }
 
-#ifdef BPF_ITERATOR_SUPPORT
-static int init_iter_state(const uint8_t iters_num) {
+static void init_iter_state(const bool disable_iterators, const uint8_t iters_num) {
+#ifndef BPF_ITERATOR_SUPPORT
+	g_state.iterators_disabled = true;
+#else
 	g_state.n_max_iters = iters_num;
 	__atomic_store_n(&g_state.n_encountered_iters, 0, __ATOMIC_SEQ_CST);
-	return 0;
-}
+	// Disable everything if iterator support is disabled by configuration or the current process is
+	// not in the root PID namespace (i.e.: iterators would have full visibility on all host
+	// processes).
+	errno = 0;  // Ensure that if any error occurs, it is not a stale one.
+	g_state.iterators_disabled =
+	        disable_iterators || !iter_support_probing__is_in_root_pid_namespace();
+	if(g_state.iterators_disabled) {
+		log_msgf(FALCOSECURITY_LOG_SEV_INFO,
+		         "disabled BPF iterators (%s)",
+		         disable_iterators
+		                 ? "requested by configuration"
+		                 : "not running in the root PID namespace, or failed to determine it");
+		clear_iter_state();
+		// Keep a single (unused) iterator slot so that iterator-related maps stay minimal.
+		g_state.n_max_iters = 1;
+		return;
+	}
+
+	// Probe support for `bpf_iter_link_info` union and its members.
+	iter_support_probing__probe_bpf_iter_link_info_support(&g_state.bpf_iter_link_info_supp_info);
+	errno = 0;  // Make logging cleaner.
+	log_msgf(FALCOSECURITY_LOG_SEV_DEBUG,
+	         "Probed `bpf_iter_link_info` support for BPF iterators (support: %s, in-kernel "
+	         "task filtering: %s)",
+	         g_state.bpf_iter_link_info_supp_info.is_available ? "yes" : "no",
+	         g_state.bpf_iter_link_info_supp_info.is_task_filtering_supported ? "yes" : "no");
 #endif /* BPF_ITERATOR_SUPPORT */
+}
 
 int pman_init_state(falcosecurity_log_fn log_fn,
                     unsigned long buf_bytes_dim,
                     double buffers_num,
                     int iters_num,
-                    bool allocate_online_only) {
+                    bool allocate_online_only,
+                    bool disable_iterators) {
 	if(buffers_num < 0) {
 		log_errorf("buffers_num cannot be negative");
 		return -1;
@@ -245,12 +278,12 @@ int pman_init_state(falcosecurity_log_fn log_fn,
 		g_state.n_required_buffers++;
 	}
 
-#ifdef BPF_ITERATOR_SUPPORT
-	/* BPF iterators configuration section */
-	if(init_iter_state((uint8_t)iters_num)) {
-		return -1;
-	}
-#endif /* BPF_ITERATOR_SUPPORT */
+	/* These will be used during the ring buffer consumption phase. */
+	g_state.last_ring_read = -1;
+	g_state.last_event_size = 0;
+
+	/* BPF iterators state initialization. */
+	init_iter_state(disable_iterators, (uint8_t)iters_num);
 
 	return 0;
 }

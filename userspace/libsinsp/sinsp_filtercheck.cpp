@@ -567,7 +567,17 @@ int32_t sinsp_filter_check::parse_field_name(std::string_view str,
 	return max_fldlen;
 }
 
+void sinsp_filter_check::invalidate_resolved() {
+	m_rhs_path = rhs_path::unresolved;
+	m_fast_cmp = fast_cmp::unresolved;
+	m_cmp_fn = nullptr;
+	m_lhs_info = nullptr;
+}
+
 void sinsp_filter_check::add_filter_value(const char* str, uint32_t len, uint32_t i) {
+	// A resolved shape holds the right-hand side it was resolved against.
+	invalidate_resolved();
+
 	if(has_filtercheck_value()) {
 		throw sinsp_exception("can't add const field value: field '" +
 		                      std::string(get_transformed_field_info()->m_name) +
@@ -619,7 +629,9 @@ void sinsp_filter_check::add_filter_value(const char* str, uint32_t len, uint32_
 			m_val_storages_max_size = parsed_len;
 		}
 	} else if(m_cmp.mod != CMPOP_MOD_NONE && (m_cmp.op == CO_EQ || m_cmp.op == CO_NE)) {
-		// equality-based ops with a modifier also use hash-set lookup in matches_any_rhs
+		// equality-based ops with a modifier use hash-set lookup:
+		//   "== anyof (...)" → set membership in matches_any_rhs
+		//   "!= allof (...)" → set non-membership in matches_all_rhs
 		ensure_unique_ptr_allocated(m_val_storages_members);
 		m_val_storages_members->insert(item);
 	} else if(m_cmp.op == CO_PMATCH) {
@@ -638,6 +650,10 @@ void sinsp_filter_check::add_filter_value(const char* str, uint32_t len, uint32_
 }
 
 void sinsp_filter_check::add_filter_value(std::unique_ptr<sinsp_filter_check> rhs_chk) {
+	// A right-hand side that is a field resolves to the general path; one resolved before it was
+	// added would not know that.
+	invalidate_resolved();
+
 	if(!get_filter_values().empty()) {
 		throw sinsp_exception(
 		        "can't add '" + std::string(rhs_chk->get_transformed_field_info()->m_name) +
@@ -764,14 +780,35 @@ size_t sinsp_filter_check::parse_filter_value(const char* str,
 	return parsed_len;
 }
 
-bool sinsp_filter_check::compare_rhs(comparator cmp,
-                                     ppm_param_type type,
-                                     std::vector<extract_value_t>& values) {
+void sinsp_filter_check::resolve_rhs_path(comparator cmp) {
+	m_rhs_path_for = cmp;
 	if(cmp.op == CO_EXISTS) {
+		// note: sinsp_filter_check_*::compare already discard NULL values
+		m_rhs_path = rhs_path::exists;
+	} else if(get_transformed_field_info()->is_list()) {
+		m_rhs_path = rhs_path::list;
+	} else if(cmp.mod != CMPOP_MOD_NONE) {
+		m_rhs_path = rhs_path::modifier;
+	} else {
+		m_rhs_path = rhs_path::single;
+	}
+}
+bool sinsp_filter_check::no_single_value(const std::vector<extract_value_t>& values) {
+	if(values.empty()) {
+		return false;
+	}
+	ASSERT(false);
+	throw sinsp_exception("non-list filter '" + std::string(m_info->m_fields[m_field_id].m_name) +
+	                      "' expected to extract a single value, but " +
+	                      std::to_string(values.size()) + " were found");
+}
+bool sinsp_filter_check::compare_rhs_multi(comparator cmp,
+                                           ppm_param_type type,
+                                           const std::vector<extract_value_t>& values) {
+	if(m_rhs_path == rhs_path::exists) {
 		return true;
 	}
-
-	if(get_transformed_field_info()->is_list()) {
+	if(m_rhs_path == rhs_path::list) {
 		// NOTE: using m_val_storages_members.find(item) relies on memcmp to
 		// compare filter_value_t values, and not the base-level flt_compare.
 		// This has two main consequences. First, this only works for equality
@@ -857,22 +894,26 @@ bool sinsp_filter_check::compare_rhs(comparator cmp,
 			                      std::string(m_info->m_fields[m_field_id].m_name) +
 			                      "' only supports operators 'exists', 'in' and 'intersects'");
 		}
-	} else if(cmp.mod != CMPOP_MOD_NONE) {
-		return compare_rhs_with_mod(cmp, type, values);
-	} else if(values.size() > 1) {
+	}
+
+	ASSERT(m_rhs_path == rhs_path::modifier);
+	if(values.size() > 1) {
 		ASSERT(false);
 		throw sinsp_exception("non-list filter '" +
 		                      std::string(m_info->m_fields[m_field_id].m_name) +
 		                      "' expected to extract a single value, but " +
 		                      std::to_string(values.size()) + " were found");
 	}
-
-	return compare_rhs(m_cmp, type, values[0].ptr, values[0].len);
+	if(values.empty()) {
+		return false;
+	}
+	return compare_rhs_with_mod(cmp, type, values);
 }
 
-static inline filter_value_t craft_filter_value(ppm_param_type type,
-                                                const void* value,
-                                                uint32_t len) {
+inline filter_value_t sinsp_filter_check::craft_filter_value(const ppm_param_type type,
+                                                             const void* value,
+                                                             uint32_t len,
+                                                             const cmpop op) {
 	// For raw strings, the length may not be set. So we do a strlen to find it.
 	switch(type) {
 	case PT_CHARBUF:
@@ -891,7 +932,17 @@ static inline filter_value_t craft_filter_value(ppm_param_type type,
 	default:
 		break;
 	}
-	return filter_value_t{(uint8_t*)value, len};
+
+	// Only values supplied to regex require sanitization.
+	if(op != CO_REGEX) {
+		return filter_value_t{(uint8_t*)value, len};
+	}
+
+	const std::string_view str_to_sanitize{static_cast<const char*>(value), len};
+	auto sanitized_str = utf8::sanitize_with_lazy_storage(str_to_sanitize, m_sanitized_str_storage);
+	auto ptr = reinterpret_cast<unsigned char*>(const_cast<char*>(sanitized_str.data()));
+	auto size = static_cast<uint32_t>(sanitized_str.size());
+	return filter_value_t{ptr, size};
 }
 
 // Certain types only support equality-based comparison in flt_compare.
@@ -908,6 +959,449 @@ static bool flt_type_is_eq_only(ppm_param_type type) {
 	default:
 		return false;
 	}
+}
+
+bool sinsp_filter_check::matches_rhs_regex(const filter_value_t& item,
+                                           const uint16_t regex_idx) const {
+	if(m_val_regexes.empty() || regex_idx >= m_val_regexes.size()) {
+		ASSERT(false);
+		return false;
+	}
+
+	const auto& regex = m_val_regexes[regex_idx];
+	if(!regex) {
+		ASSERT(false);
+		return false;
+	}
+
+	const re2::StringPiece text(reinterpret_cast<const char*>(item.first), item.second);
+	return regex->Match(text, 0, item.second, re2::RE2::Anchor::ANCHOR_BOTH, nullptr, 0);
+}
+
+// The operator, applied to values already widened to 64 bits. Both sides of a check's comparison
+// are fixed by the filter, so this is all that is left of flt_compare's two switches.
+static inline bool fast_compare_s64(cmpop op, int64_t lhs, int64_t rhs) {
+	switch(op) {
+	case CO_EQ:
+		return lhs == rhs;
+	case CO_NE:
+		return lhs != rhs;
+	case CO_LT:
+		return lhs < rhs;
+	case CO_LE:
+		return lhs <= rhs;
+	case CO_GT:
+		return lhs > rhs;
+	case CO_GE:
+		return lhs >= rhs;
+	default:
+		// resolve_fast_cmp_kind gives an integer a shape only for the six operators above.
+		ASSERT(false);
+		return false;
+	}
+}
+
+static inline bool fast_compare_u64(cmpop op, uint64_t lhs, uint64_t rhs) {
+	switch(op) {
+	case CO_EQ:
+		return lhs == rhs;
+	case CO_NE:
+		return lhs != rhs;
+	case CO_LT:
+		return lhs < rhs;
+	case CO_LE:
+		return lhs <= rhs;
+	case CO_GT:
+		return lhs > rhs;
+	case CO_GE:
+		return lhs >= rhs;
+	default:
+		// resolve_fast_cmp_kind gives an integer a shape only for the six operators above.
+		ASSERT(false);
+		return false;
+	}
+}
+
+void sinsp_filter_check::resolve_fast_cmp_kind(comparator cmp, ppm_param_type type) {
+	m_fast_cmp_for = cmp;
+	m_fast_cmp_type = type;
+	m_fast_cmp = fast_cmp::none;
+
+	// A right-hand side that is a FIELD is re-extracted into m_vals on every event (see
+	// populate_filter_values_with_rhs_extracted_values), so nothing about it may be cached.
+	if(has_filtercheck_value()) {
+		return;
+	}
+
+	// One right-hand value, no modifier, and an operator that is an ordering, an equality, or one
+	// of the three substring tests. Which of those a type admits is decided per family below.
+	if(m_vals.size() != 1 || cmp.mod != CMPOP_MOD_NONE) {
+		return;
+	}
+	switch(cmp.op) {
+	case CO_EQ:
+	case CO_NE:
+	case CO_LT:
+	case CO_LE:
+	case CO_GT:
+	case CO_GE:
+	case CO_STARTSWITH:
+	case CO_CONTAINS:
+	case CO_ENDSWITH:
+		break;
+	default:
+		return;
+	}
+
+	// Strings: the two equalities and the three substring tests, with the right-hand length (which
+	// startswith and endswith need) measured once. The orderings stay general. The path types are
+	// strings to flt_compare too -- all three reach flt_compare_string.
+	if(type == PT_CHARBUF || type == PT_FSPATH || type == PT_FSRELPATH) {
+		if(filter_value_p() == nullptr) {
+			return;
+		}
+		m_fast_rhs_len = strlen((const char*)filter_value_p());
+		switch(cmp.op) {
+		case CO_EQ:
+			m_fast_cmp = fast_cmp::str_eq;
+			return;
+		case CO_NE:
+			m_fast_cmp = fast_cmp::str_ne;
+			return;
+		case CO_STARTSWITH:
+			m_fast_cmp = fast_cmp::str_startswith;
+			return;
+		case CO_CONTAINS:
+			m_fast_cmp = fast_cmp::str_contains;
+			return;
+		case CO_ENDSWITH:
+			m_fast_cmp = fast_cmp::str_endswith;
+			return;
+		default:
+			return;
+		}
+	}
+
+	// Addresses and networks. Only equality and inequality reach here: `in` and `intersects` are
+	// handled as set membership above, and nothing else is comparable for these types.
+	//
+	// Which of the four shapes this is comes from the type when the type names a family, and from
+	// the width of the parsed right-hand side when it does not. The distinction matters twice: a
+	// concrete type must not be talked out of its family by a right-hand side of the other one:
+	// `fd.ip = 1.2.3.4` against an IPv6 socket is false, not a comparison of the first four bytes.
+	if(type == PT_IPADDR || type == PT_IPNET || type == PT_IPV4ADDR || type == PT_IPV6ADDR ||
+	   type == PT_IPV4NET || type == PT_IPV6NET) {
+		if((cmp.op != CO_EQ && cmp.op != CO_NE) || filter_value_p() == nullptr) {
+			return;
+		}
+		const auto rhs_len = filter_value_len();
+		const bool v4_addr =
+		        (type == PT_IPV4ADDR) || (type == PT_IPADDR && rhs_len == sizeof(struct in_addr));
+		const bool v6_addr =
+		        (type == PT_IPV6ADDR) || (type == PT_IPADDR && rhs_len == sizeof(ipv6addr));
+		const bool v4_net =
+		        (type == PT_IPV4NET) || (type == PT_IPNET && rhs_len == sizeof(ipv4net));
+		if(v4_addr && rhs_len == sizeof(struct in_addr)) {
+			uint32_t addr;
+			memcpy(&addr, filter_value_p(), sizeof(addr));
+			m_fast_rhs_u64 = addr;
+			m_fast_cmp = fast_cmp::ip4;
+		} else if(v6_addr && rhs_len == sizeof(ipv6addr)) {
+			memcpy(m_fast_ip6, filter_value_p(), sizeof(m_fast_ip6));
+			m_fast_cmp = fast_cmp::ip6;
+		} else if(v4_net && rhs_len == sizeof(ipv4net)) {
+			ipv4net net;
+			memcpy(&net, filter_value_p(), sizeof(net));
+			m_fast_mask4 = net.m_netmask;
+			// flt_compare_ipv4net masks the network by its own netmask on every event, though both
+			// are constants; here it happens once.
+			m_fast_rhs_u64 = net.m_ip & net.m_netmask;
+			m_fast_cmp = fast_cmp::net4;
+		}
+		// Anything else keeps the general path: a right-hand side of the other family (which
+		// flt_compare answers from its width alone), and IPv6 networks, whose tail-bit handling in
+		// ipv6net::in_cidr is not worth duplicating for the gain.
+		return;
+	}
+
+	// A boolean is compared as a widened word, but only for equality: flt_compare_bool refuses an
+	// ordering, and a fast path that answered one would be a different filter language.
+	if(type == PT_BOOL && cmp.op != CO_EQ && cmp.op != CO_NE) {
+		return;
+	}
+
+	// From here on only the orderings and the equalities have a shape. A substring test on a number
+	// is refused when the filter is compiled; one that gets here anyway goes to flt_compare, which
+	// throws, rather than being answered as some other operator.
+	if(cmp.op == CO_STARTSWITH || cmp.op == CO_CONTAINS || cmp.op == CO_ENDSWITH) {
+		return;
+	}
+
+	// The integer types, by the width flt_compare would have cast them through. The stored
+	// right-hand side is read at that same width here, once.
+	fast_cmp kind = fast_cmp::none;
+	size_t width = 0;
+	bool is_signed = false;
+	switch(type) {
+	case PT_INT8:
+		kind = fast_cmp::s8;
+		width = 1;
+		is_signed = true;
+		break;
+	case PT_INT16:
+		kind = fast_cmp::s16;
+		width = 2;
+		is_signed = true;
+		break;
+	case PT_INT32:
+		kind = fast_cmp::s32;
+		width = 4;
+		is_signed = true;
+		break;
+	case PT_INT64:
+	case PT_FD:
+	case PT_PID:
+	case PT_ERRNO:
+		kind = fast_cmp::s64;
+		width = 8;
+		is_signed = true;
+		break;
+	case PT_FLAGS8:
+	case PT_ENUMFLAGS8:
+	case PT_UINT8:
+	case PT_SIGTYPE:
+		kind = fast_cmp::u8;
+		width = 1;
+		break;
+	case PT_FLAGS16:
+	case PT_ENUMFLAGS16:
+	case PT_UINT16:
+	case PT_PORT:
+	case PT_SYSCALLID:
+		kind = fast_cmp::u16;
+		width = 2;
+		break;
+	case PT_FLAGS32:
+	case PT_ENUMFLAGS32:
+	case PT_UINT32:
+	case PT_MODE:
+	case PT_UID:
+	case PT_GID:
+	case PT_BOOL:
+		kind = fast_cmp::u32;
+		width = 4;
+		break;
+	case PT_UINT64:
+	case PT_RELTIME:
+	case PT_ABSTIME:
+		kind = fast_cmp::u64;
+		width = 8;
+		break;
+	default:
+		return;
+	}
+	if(filter_value_p() == nullptr || filter_value_len() != width) {
+		return;
+	}
+
+	// Read it at the width it was stored at and let the integer conversion widen it, which
+	// is what flt_cast does. Copying `width` bytes into a uint64_t instead would put them at
+	// the low-addressed end, which is the HIGH half on a big-endian target: an s390x `user.uid
+	// = 1000` would compare against 1000 << 32. Sign extension comes from the conversion too.
+	if(is_signed) {
+		switch(width) {
+		case 1:
+			m_fast_rhs_s64 = rawval_cast<int8_t>(filter_value_p());
+			break;
+		case 2:
+			m_fast_rhs_s64 = rawval_cast<int16_t>(filter_value_p());
+			break;
+		case 4:
+			m_fast_rhs_s64 = rawval_cast<int32_t>(filter_value_p());
+			break;
+		case 8:
+			m_fast_rhs_s64 = rawval_cast<int64_t>(filter_value_p());
+			break;
+		default:
+			return;
+		}
+	} else {
+		switch(width) {
+		case 1:
+			m_fast_rhs_u64 = rawval_cast<uint8_t>(filter_value_p());
+			break;
+		case 2:
+			m_fast_rhs_u64 = rawval_cast<uint16_t>(filter_value_p());
+			break;
+		case 4:
+			m_fast_rhs_u64 = rawval_cast<uint32_t>(filter_value_p());
+			break;
+		case 8:
+			m_fast_rhs_u64 = rawval_cast<uint64_t>(filter_value_p());
+			break;
+		default:
+			return;
+		}
+	}
+	m_fast_cmp = kind;
+}
+
+template<typename T>
+int8_t sinsp_filter_check::resolved_cmp_signed(sinsp_filter_check* chk,
+                                               comparator cmp,
+                                               const void* val,
+                                               uint32_t len) {
+	// A value extracted at another width (evt.rawarg.* can do that) is not ours.
+	if(len != sizeof(T)) {
+		return -1;
+	}
+	T v;
+	memcpy(&v, val, sizeof(v));
+	return fast_compare_s64(cmp.op, v, chk->m_fast_rhs_s64) ? 1 : 0;
+}
+
+template<typename T>
+int8_t sinsp_filter_check::resolved_cmp_unsigned(sinsp_filter_check* chk,
+                                                 comparator cmp,
+                                                 const void* val,
+                                                 uint32_t len) {
+	// A value extracted at another width (evt.rawarg.* can do that) is not ours.
+	if(len != sizeof(T)) {
+		return -1;
+	}
+	T v;
+	memcpy(&v, val, sizeof(v));
+	return fast_compare_u64(cmp.op, v, chk->m_fast_rhs_u64) ? 1 : 0;
+}
+
+int8_t sinsp_filter_check::resolved_cmp_str_eq(sinsp_filter_check* chk,
+                                               comparator,
+                                               const void* val,
+                                               uint32_t) {
+	return strcmp((const char*)val, (const char*)chk->filter_value_p()) == 0 ? 1 : 0;
+}
+
+int8_t sinsp_filter_check::resolved_cmp_str_ne(sinsp_filter_check* chk,
+                                               comparator,
+                                               const void* val,
+                                               uint32_t) {
+	return strcmp((const char*)val, (const char*)chk->filter_value_p()) != 0 ? 1 : 0;
+}
+
+int8_t sinsp_filter_check::resolved_cmp_str_startswith(sinsp_filter_check* chk,
+                                                       comparator,
+                                                       const void* val,
+                                                       uint32_t) {
+	return strncmp((const char*)val, (const char*)chk->filter_value_p(), chk->m_fast_rhs_len) == 0
+	               ? 1
+	               : 0;
+}
+
+int8_t sinsp_filter_check::resolved_cmp_str_contains(sinsp_filter_check* chk,
+                                                     comparator,
+                                                     const void* val,
+                                                     uint32_t) {
+	return strstr((const char*)val, (const char*)chk->filter_value_p()) != nullptr ? 1 : 0;
+}
+
+int8_t sinsp_filter_check::resolved_cmp_str_endswith(sinsp_filter_check* chk,
+                                                     comparator,
+                                                     const void* val,
+                                                     uint32_t) {
+	return sinsp_utils::endswith((const char*)val,
+	                             (const char*)chk->filter_value_p(),
+	                             strlen((const char*)val),
+	                             chk->m_fast_rhs_len)
+	               ? 1
+	               : 0;
+}
+
+int8_t sinsp_filter_check::resolved_cmp_ip4(sinsp_filter_check* chk,
+                                            comparator cmp,
+                                            const void* val,
+                                            uint32_t len) {
+	if(len != sizeof(struct in_addr)) {
+		return -1;
+	}
+	uint32_t addr;
+	memcpy(&addr, val, sizeof(addr));
+	return (addr == static_cast<uint32_t>(chk->m_fast_rhs_u64)) == (cmp.op == CO_EQ) ? 1 : 0;
+}
+
+int8_t sinsp_filter_check::resolved_cmp_net4(sinsp_filter_check* chk,
+                                             comparator cmp,
+                                             const void* val,
+                                             uint32_t len) {
+	if(len != sizeof(struct in_addr)) {
+		return -1;
+	}
+	uint32_t addr;
+	memcpy(&addr, val, sizeof(addr));
+	// The network was masked by its own netmask when the shape was resolved, so an event pays one
+	// AND and one compare.
+	return ((addr & chk->m_fast_mask4) == static_cast<uint32_t>(chk->m_fast_rhs_u64)) ==
+	                       (cmp.op == CO_EQ)
+	               ? 1
+	               : 0;
+}
+
+int8_t sinsp_filter_check::resolved_cmp_ip6(sinsp_filter_check* chk,
+                                            comparator cmp,
+                                            const void* val,
+                                            uint32_t len) {
+	if(len != sizeof(ipv6addr)) {
+		return -1;
+	}
+	uint64_t addr[2];
+	memcpy(addr, val, sizeof(addr));
+	return (addr[0] == chk->m_fast_ip6[0] && addr[1] == chk->m_fast_ip6[1]) == (cmp.op == CO_EQ)
+	               ? 1
+	               : 0;
+}
+
+sinsp_filter_check::resolved_cmp_fn sinsp_filter_check::resolved_cmp_for(fast_cmp kind) {
+	switch(kind) {
+	case fast_cmp::s8:
+		return &resolved_cmp_signed<int8_t>;
+	case fast_cmp::s16:
+		return &resolved_cmp_signed<int16_t>;
+	case fast_cmp::s32:
+		return &resolved_cmp_signed<int32_t>;
+	case fast_cmp::s64:
+		return &resolved_cmp_signed<int64_t>;
+	case fast_cmp::u8:
+		return &resolved_cmp_unsigned<uint8_t>;
+	case fast_cmp::u16:
+		return &resolved_cmp_unsigned<uint16_t>;
+	case fast_cmp::u32:
+		return &resolved_cmp_unsigned<uint32_t>;
+	case fast_cmp::u64:
+		return &resolved_cmp_unsigned<uint64_t>;
+	case fast_cmp::str_eq:
+		return &resolved_cmp_str_eq;
+	case fast_cmp::str_ne:
+		return &resolved_cmp_str_ne;
+	case fast_cmp::str_startswith:
+		return &resolved_cmp_str_startswith;
+	case fast_cmp::str_contains:
+		return &resolved_cmp_str_contains;
+	case fast_cmp::str_endswith:
+		return &resolved_cmp_str_endswith;
+	case fast_cmp::ip4:
+		return &resolved_cmp_ip4;
+	case fast_cmp::net4:
+		return &resolved_cmp_net4;
+	case fast_cmp::ip6:
+		return &resolved_cmp_ip6;
+	default:
+		// none, and unresolved: there is no shape to call.
+		return nullptr;
+	}
+}
+
+void sinsp_filter_check::resolve_fast_cmp(comparator cmp, ppm_param_type type) {
+	resolve_fast_cmp_kind(cmp, type);
+	m_cmp_fn = resolved_cmp_for(m_fast_cmp);
 }
 
 bool sinsp_filter_check::compare_rhs(comparator cmp,
@@ -936,7 +1430,7 @@ bool sinsp_filter_check::compare_rhs(comparator cmp,
 			}
 			return false;
 		} else {
-			auto item = craft_filter_value(type, operand1, op1_len);
+			const auto item = craft_filter_value(type, operand1, op1_len, cmp.op);
 
 			if(cmp.op == CO_IN || cmp.op == CO_INTERSECTS) {
 				// CO_INTERSECTS is really more interesting when a filtercheck can extract
@@ -965,18 +1459,27 @@ bool sinsp_filter_check::compare_rhs(comparator cmp,
 		case PT_CHARBUF:
 		case PT_FSPATH:
 		case PT_FSRELPATH:
-			if(!m_val_regexes.empty() && m_val_regexes[0]) {
-				auto item = craft_filter_value(type, operand1, op1_len);
-				re2::StringPiece s(reinterpret_cast<const char*>(item.first), item.second);
-				return m_val_regexes[0]
-				        ->Match(s, 0, item.second, re2::RE2::Anchor::ANCHOR_BOTH, nullptr, 0);
-			}
-			// fallthrough
+			return matches_rhs_regex(craft_filter_value(type, operand1, op1_len, cmp.op), 0);
 		default:
 			ASSERT(false);
 			return false;
 		};
 	default:
+		// The shape of this comparison never changes, and resolving it once turns flt_compare's two
+		// switches and two casts into a load and a compare. A compiled check's operator and
+		// modifier never change either, so the shape is resolved on the first event and trusted
+		// afterwards -- except for the type, which evt.rawarg.* rewrites per event.
+		if(m_fast_cmp == fast_cmp::unresolved || type != m_fast_cmp_type) {
+			resolve_fast_cmp(cmp, type);
+		}
+		ASSERT(m_cmp_fn == nullptr ||
+		       (cmp.op == m_fast_cmp_for.op && cmp.mod == m_fast_cmp_for.mod));
+		if(m_cmp_fn != nullptr) {
+			const int8_t res = m_cmp_fn(this, cmp, operand1, op1_len);
+			if(res >= 0) {
+				return res != 0;
+			}
+		}
 		return (::flt_compare(cmp, type, operand1, filter_value_p(), op1_len, filter_value_len()));
 	}
 }
@@ -987,9 +1490,7 @@ bool sinsp_filter_check::matches_rhs_elem(const filter_value_t& item,
                                           ppm_param_type type) {
 	// Returns true if item matches RHS element i.
 	if(cmp.op == CO_REGEX) {
-		re2::StringPiece s(reinterpret_cast<const char*>(item.first), item.second);
-		return m_val_regexes[i]
-		        ->Match(s, 0, item.second, re2::RE2::Anchor::ANCHOR_BOTH, nullptr, 0);
+		return matches_rhs_regex(item, i);
 	}
 	return ::flt_compare(cmp,
 	                     type,
@@ -999,28 +1500,33 @@ bool sinsp_filter_check::matches_rhs_elem(const filter_value_t& item,
 	                     filter_value_len(i));
 }
 
+bool sinsp_filter_check::matches_one_rhs(const filter_value_t& item,
+                                         uint16_t n_rhs,
+                                         comparator cmp,
+                                         ppm_param_type type) {
+	ASSERT(n_rhs > 0);
+	int num_matches = 0;
+	for(uint16_t i = 0; i < n_rhs; i++) {
+		if(!matches_rhs_elem(item, i, cmp, type)) {
+			continue;
+		}
+		if(++num_matches > 1) {
+			return false;
+		}
+	}
+	return num_matches == 1;
+}
+
 bool sinsp_filter_check::matches_any_rhs(const filter_value_t& item,
                                          uint16_t n_rhs,
                                          comparator cmp,
                                          ppm_param_type type) {
-	// "item not in set": iterate as membership (item == element[i]) and negate the
-	// aggregate. Passing CO_NE through to flt_compare per element would test inequality
-	// per element instead, which is not the intended semantics.
-	if(cmp.op == CO_NE) {
-		if(m_val_storages_members) {
-			return m_val_storages_members->find(item) == m_val_storages_members->end();
-		}
-		for(uint16_t i = 0; i < n_rhs; i++) {
-			if(matches_rhs_elem(item, i, comparator{CO_EQ}, type)) {
-				return false;
-			}
-		}
-		return true;
-	}
-	// "item matches some element" under cmp.
-	if(m_val_storages_members && cmp.op != CO_REGEX) {
+	ASSERT(n_rhs > 0);
+	// "== anyof (...)" can be interpreted as "is in set {...}".
+	if(cmp.op == CO_EQ && m_val_storages_members) {
 		return m_val_storages_members->find(item) != m_val_storages_members->end();
 	}
+
 	for(uint16_t i = 0; i < n_rhs; i++) {
 		if(matches_rhs_elem(item, i, cmp, type)) {
 			return true;
@@ -1033,14 +1539,12 @@ bool sinsp_filter_check::matches_all_rhs(const filter_value_t& item,
                                          uint16_t n_rhs,
                                          comparator cmp,
                                          ppm_param_type type) {
-	// True if item matches all RHS elements.
-	// For CO_NE: equivalent to matches_any_rhs (AND of != is the same as not-in-set).
-	if(cmp.op == CO_NE) {
-		return matches_any_rhs(item, n_rhs, cmp, type);
+	ASSERT(n_rhs > 0);
+	// "!= allof (...)" can be interpreted as "not in set {...}".
+	if(cmp.op == CO_NE && m_val_storages_members) {
+		return m_val_storages_members->find(item) == m_val_storages_members->end();
 	}
-	if(n_rhs == 0) {
-		return false;
-	}
+
 	for(uint16_t i = 0; i < n_rhs; i++) {
 		if(!matches_rhs_elem(item, i, cmp, type)) {
 			return false;
@@ -1051,47 +1555,31 @@ bool sinsp_filter_check::matches_all_rhs(const filter_value_t& item,
 
 bool sinsp_filter_check::compare_rhs_with_mod(comparator cmp,
                                               ppm_param_type type,
-                                              std::vector<extract_value_t>& values) {
+                                              const std::vector<extract_value_t>& values) {
 	// Certain types only support equality-based comparison in flt_compare (e.g. network
 	// and socket types); for all others the full operator is used. This mirrors the
-	// special-casing in compare_rhs for CO_IN/CO_INTERSECTS with those types. CO_NE is
-	// preserved so matches_any_rhs can apply the membership-inversion fast path; CO_REGEX
+	// special-casing in compare_rhs for CO_IN/CO_INTERSECTS with those types. CO_NE
+	// is preserved so matches_all_rhs can apply its "v ∉ R" fast path, and CO_REGEX
 	// is preserved because it has its own per-element path.
 	if(flt_type_is_eq_only(type) && cmp.op != CO_EQ && cmp.op != CO_NE && cmp.op != CO_REGEX) {
 		cmp.op = CO_EQ;
 	}
 	const uint16_t n_rhs = cmp.op == CO_REGEX ? static_cast<uint16_t>(m_val_regexes.size())
 	                                          : static_cast<uint16_t>(m_vals.size());
-
-	switch(cmp.mod) {
-	case CMPOP_MOD_ONEOF: {
-		// true if exactly one extracted value matches any RHS value
-		uint32_t count = 0;
-		for(const auto& it : values) {
-			if(matches_any_rhs(craft_filter_value(type, it.ptr, it.len), n_rhs, cmp, type)) {
-				if(++count > 1) {
-					return false;
-				}
-			}
-		}
-		return count == 1;
-	}
-	case CMPOP_MOD_ANYOF:
-		// true if at least one extracted value matches any RHS value
-		for(const auto& it : values) {
-			if(matches_any_rhs(craft_filter_value(type, it.ptr, it.len), n_rhs, cmp, type)) {
-				return true;
-			}
-		}
+	if(n_rhs == 0) {
 		return false;
+	}
+
+	ASSERT(values.size() == 1);
+	const auto& [value_ptr, value_len] = values[0];
+	const auto filter_value = craft_filter_value(type, value_ptr, value_len, cmp.op);
+	switch(cmp.mod) {
+	case CMPOP_MOD_ONEOF:
+		return matches_one_rhs(filter_value, n_rhs, cmp, type);
+	case CMPOP_MOD_ANYOF:
+		return matches_any_rhs(filter_value, n_rhs, cmp, type);
 	case CMPOP_MOD_ALLOF:
-		// true if every extracted value matches ALL RHS values
-		for(const auto& it : values) {
-			if(!matches_all_rhs(craft_filter_value(type, it.ptr, it.len), n_rhs, cmp, type)) {
-				return false;
-			}
-		}
-		return true;
+		return matches_all_rhs(filter_value, n_rhs, cmp, type);
 	default:
 		ASSERT(false);
 		throw sinsp_exception("unexpected modifier in compare_rhs_with_mod");
@@ -1100,45 +1588,48 @@ bool sinsp_filter_check::compare_rhs_with_mod(comparator cmp,
 
 bool sinsp_filter_check::extract_nocache(sinsp_evt* evt,
                                          std::vector<extract_value_t>& values,
-                                         std::vector<extract_offset_t>* offsets,
-                                         bool sanitize_strings) {
-	values.clear();
+                                         std::vector<extract_offset_t>* offsets) {
+	extract_value_t val;
+	val.ptr = extract_single(evt, &val.len);
+	if(val.ptr == NULL) {
+		values.clear();
+		if(offsets) {
+			offsets->clear();
+		}
+		return false;
+	}
+	// Same story as the cache's: the vector holds one value from the previous event, so overwrite
+	// it instead of going through clear() and push_back()'s capacity check.
+	if(values.size() == 1) {
+		values[0] = val;
+	} else {
+		values.clear();
+		values.push_back(val);
+	}
 	if(offsets) {
 		offsets->clear();
+		offsets->emplace_back(extract_offset_t{UINT32_MAX, UINT32_MAX});
 	}
-	extract_value_t val;
-	val.ptr = extract_single(evt, &val.len, sanitize_strings);
-	if(val.ptr != NULL) {
-		values.push_back(val);
-		if(offsets) {
-			offsets->emplace_back(extract_offset_t{UINT32_MAX, UINT32_MAX});
-		}
-		return true;
-	}
-	return false;
+	return true;
 }
 
-uint8_t* sinsp_filter_check::extract_single(sinsp_evt* evt, uint32_t* len, bool sanitize_strings) {
+uint8_t* sinsp_filter_check::extract_single(sinsp_evt* evt, uint32_t* len) {
 	return NULL;
 }
 
-bool sinsp_filter_check::extract(sinsp_evt* evt,
-                                 std::vector<extract_value_t>& values,
-                                 bool sanitize_strings) {
-	return extract_with_offsets(evt, values, nullptr, sanitize_strings);
+bool sinsp_filter_check::extract(sinsp_evt* evt, std::vector<extract_value_t>& values) {
+	return extract_with_offsets(evt, values, nullptr);
 }
 
 bool sinsp_filter_check::extract_with_offsets(sinsp_evt* evt,
                                               std::vector<extract_value_t>& values,
-                                              std::vector<extract_offset_t>& offsets,
-                                              bool sanitize_strings) {
-	return extract_with_offsets(evt, values, &offsets, sanitize_strings);
+                                              std::vector<extract_offset_t>& offsets) {
+	return extract_with_offsets(evt, values, &offsets);
 }
 
 bool sinsp_filter_check::extract_with_offsets(sinsp_evt* evt,
                                               std::vector<extract_value_t>& values,
-                                              std::vector<extract_offset_t>* offsets,
-                                              bool sanitize_strings) {
+                                              std::vector<extract_offset_t>* offsets) {
 	if(m_cache_metrics != NULL) {
 		m_cache_metrics->m_num_extract++;
 	}
@@ -1146,20 +1637,16 @@ bool sinsp_filter_check::extract_with_offsets(sinsp_evt* evt,
 	// no cache is installed, so just default to non-cached extraction
 	if(!m_extract_cache) {
 		// extract values and apply transformers on top of them
-		return extract_nocache(evt, values, offsets, sanitize_strings) &&
-		       apply_transformers(values);
+		return extract_nocache(evt, values, offsets) && apply_transformers(values);
 	}
 
 	// cache is not valid for this event, so we perform a non-cached extraction
 	// and update it for the next time. We cache both failed and succeeded extractions
 	if(!m_extract_cache->is_valid(evt)) {
-		// for now, we support only shallow copies of cached values for performance
-		// gains -- we rely on each filtercheck to keep owning the result values
-		// across different extractions
-		bool deepcopy = false;
-		auto res = extract_nocache(evt, values, offsets, sanitize_strings) &&
-		           apply_transformers(values);
-		m_extract_cache->update(evt, res, values, deepcopy);
+		// The cached values are shallow copies: each filtercheck keeps owning what they point at
+		// across extractions.
+		auto res = extract_nocache(evt, values, offsets) && apply_transformers(values);
+		m_extract_cache->update(evt, res, values);
 		return res;
 	}
 
@@ -1197,24 +1684,28 @@ bool sinsp_filter_check::compare(sinsp_evt* evt) {
 }
 
 bool sinsp_filter_check::compare_nocache(sinsp_evt* evt) {
-	m_extracted_values.clear();
-	if(!extract(evt, m_extracted_values, false)) {
+	if(!extract_in_place(evt)) {
 		return false;
 	}
+	// Where they are stays put across the right-hand side's extraction below. They are in the cache
+	// only after a hit, and a hit means the cache already holds this event, so a right-hand side
+	// sharing it hits too and does not write it. (Event number 0 never hits, so it never gets here
+	// pointing into the cache.)
+	const auto* values = m_values_in_place;
 
-	auto lhs_type = get_transformed_field_info()->m_type;
+	auto lhs_type = lhs_info()->m_type;
 	if(has_filtercheck_value()) {
 		check_rhs_field_type_consistency();
 
 		m_rhs_filter_check->m_extracted_values.clear();
-		if(!m_rhs_filter_check->extract(evt, m_rhs_filter_check->m_extracted_values, false)) {
+		if(!m_rhs_filter_check->extract(evt, m_rhs_filter_check->m_extracted_values)) {
 			return false;
 		}
 
 		populate_filter_values_with_rhs_extracted_values(m_rhs_filter_check->m_extracted_values);
 	}
 
-	return compare_rhs(m_cmp, lhs_type, m_extracted_values);
+	return compare_rhs(m_cmp, lhs_type, *values);
 }
 
 void sinsp_filter_check::add_transformer(filter_transformer_type trtype) {
@@ -1246,6 +1737,10 @@ void sinsp_filter_check::add_transformer(filter_transformer_type trtype) {
 		                      std::string(get_field_info()->m_name) + "'");
 	}
 
+	// Both resolved shapes described the field as it was before this transformer: transform_type
+	// above may have changed its type and its flags, list-ness included.
+	invalidate_resolved();
+
 	// add transformer to the back of the list, they will be applied at
 	// runtime from least-recently-added to most-recently-added. This is also
 	// the same order by which type trasformations are applied in the block above
@@ -1255,6 +1750,11 @@ void sinsp_filter_check::add_transformer(filter_transformer_type trtype) {
 }
 
 bool sinsp_filter_check::apply_transformers(std::vector<extract_value_t>& values) {
+	// Most checks have none, and then there is nothing to look up either.
+	if(m_transformers.empty()) {
+		return true;
+	}
+
 	const filtercheck_field_info* field_info = get_field_info();
 	auto field_type = field_info->m_type;
 	auto field_flags = field_info->m_flags;

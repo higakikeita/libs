@@ -30,8 +30,8 @@ TEST_F(scap_file_test, kexec_arm64_tail_lineage) {
 	 */
 	auto containerd_shim1_tinfo = thread_manager->find_thread(141207, true);
 	ASSERT_TRUE(containerd_shim1_tinfo);
-	ASSERT_TRUE(containerd_shim1_tinfo->m_tginfo);
-	ASSERT_FALSE(containerd_shim1_tinfo->m_tginfo->is_reaper());
+	ASSERT_TRUE(containerd_shim1_tinfo->get_tginfo());
+	ASSERT_FALSE(containerd_shim1_tinfo->get_tginfo()->is_reaper());
 
 	/* Search the tail execve event */
 	int64_t tid_tail = 141546;
@@ -79,8 +79,8 @@ TEST_F(scap_file_test, kexec_arm64_tail_lineage) {
 	/* At the beninning of the capture containerd_shim1 was not a reaper */
 	containerd_shim1_tinfo = thread_manager->find_thread(tid_containerd_shim1, true);
 	ASSERT_TRUE(containerd_shim1_tinfo);
-	ASSERT_TRUE(containerd_shim1_tinfo->m_tginfo);
-	ASSERT_TRUE(containerd_shim1_tinfo->m_tginfo->is_reaper());
+	ASSERT_TRUE(containerd_shim1_tinfo->get_tginfo());
+	ASSERT_TRUE(containerd_shim1_tinfo->get_tginfo()->is_reaper());
 }
 
 TEST_F(scap_file_test, kexec_arm64_final_thread_table_dim) {

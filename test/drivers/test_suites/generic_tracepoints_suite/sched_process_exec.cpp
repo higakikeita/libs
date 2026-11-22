@@ -108,6 +108,21 @@
 	umount2(mergedir, MNT_FORCE);         \
 	rmdir(mergedir);
 
+#if defined(__NR_execve) || defined(__NR_execveat)
+void assert_ctime_mtime_params(const std::unique_ptr<event_test> &evt_test) {
+	// These are absolute times that must already have happened: see
+	// assert_abstime_param_in_the_past().
+
+	/* Parameter 25: exe_file ctime (last status change time, epoch value in nanoseconds) (type:
+	 * PT_ABSTIME) */
+	evt_test->assert_abstime_param_in_the_past(25);
+
+	/* Parameter 26: exe_file mtime (last modification time, epoch value in nanoseconds) (type:
+	 * PT_ABSTIME) */
+	evt_test->assert_abstime_param_in_the_past(26);
+}
+#endif
+
 /* execve section */
 #ifdef __NR_execve
 
@@ -247,16 +262,7 @@ TEST(GenericTracepoints, sched_proc_exec_execve) {
 	/* Parameter 24: exe_file ino (type: PT_UINT64) */
 	evt_test->assert_numeric_param(24, (uint64_t)1, GREATER_EQUAL);
 
-	// This is used as reasonable safe lower bound for ctime and mtime.
-	constexpr uint64_t safe_epoch_ns = 631152000000000000ULL;  // 1 Jan, 1990.
-
-	/* Parameter 25: exe_file ctime (last status change time, epoch value in nanoseconds) (type:
-	 * PT_ABSTIME) */
-	evt_test->assert_numeric_param(25, safe_epoch_ns, GREATER_EQUAL);
-
-	/* Parameter 26: exe_file mtime (last modification time, epoch value in nanoseconds) (type:
-	 * PT_ABSTIME) */
-	evt_test->assert_numeric_param(26, safe_epoch_ns, GREATER_EQUAL);
+	assert_ctime_mtime_params(evt_test);
 
 	/* Parameter 27: euid (type: PT_UID) */
 	evt_test->assert_numeric_param(27, (uint32_t)geteuid(), EQUAL);
@@ -506,11 +512,11 @@ TEST(GenericTracepoints, sched_proc_exec_execve_not_upperlayer) {
 
 	/* Parameter 25: exe_file ctime (last status change time, epoch value in nanoseconds) (type:
 	 * PT_ABSTIME) */
-	evt_test->assert_numeric_param(25, (uint64_t)1000000000000000000, GREATER_EQUAL);
+	evt_test->assert_abstime_param_in_the_past(25);
 
 	/* Parameter 26: exe_file mtime (last modifitrueion time, epoch value in nanoseconds) (type:
 	 * PT_ABSTIME) */
-	evt_test->assert_numeric_param(26, (uint64_t)1000000000000000000, GREATER_EQUAL);
+	evt_test->assert_abstime_param_in_the_past(26);
 
 	/* Parameter 27: euid (type: PT_UID) */
 	evt_test->assert_numeric_param(27, (uint32_t)geteuid(), EQUAL);
@@ -639,11 +645,11 @@ TEST(GenericTracepoints, sched_proc_exec_execve_upperlayer) {
 
 	/* Parameter 25: exe_file ctime (last status change time, epoch value in nanoseconds) (type:
 	 * PT_ABSTIME) */
-	evt_test->assert_numeric_param(25, (uint64_t)1000000000000000000, GREATER_EQUAL);
+	evt_test->assert_abstime_param_in_the_past(25);
 
 	/* Parameter 26: exe_file mtime (last modifitrueion time, epoch value in nanoseconds) (type:
 	 * PT_ABSTIME) */
-	evt_test->assert_numeric_param(26, (uint64_t)1000000000000000000, GREATER_EQUAL);
+	evt_test->assert_abstime_param_in_the_past(26);
 
 	/* Parameter 27: euid (type: PT_UID) */
 	evt_test->assert_numeric_param(27, (uint32_t)geteuid(), EQUAL);
@@ -981,16 +987,7 @@ TEST(GenericTracepoints, sched_proc_exec_execveat) {
 	/* Parameter 24: exe_file ino (type: PT_UINT64) */
 	evt_test->assert_numeric_param(24, (uint64_t)1, GREATER_EQUAL);
 
-	// This is used as reasonable safe lower bound for ctime and mtime.
-	constexpr uint64_t safe_epoch_ns = 631152000000000000ULL;  // 1 Jan, 1990.
-
-	/* Parameter 25: exe_file ctime (last status change time, epoch value in nanoseconds) (type:
-	 * PT_ABSTIME) */
-	evt_test->assert_numeric_param(25, safe_epoch_ns, GREATER_EQUAL);
-
-	/* Parameter 26: exe_file mtime (last modification time, epoch value in nanoseconds) (type:
-	 * PT_ABSTIME) */
-	evt_test->assert_numeric_param(26, safe_epoch_ns, GREATER_EQUAL);
+	assert_ctime_mtime_params(evt_test);
 
 	/* Parameter 27: euid (type: PT_UID) */
 	evt_test->assert_numeric_param(27, (uint32_t)geteuid(), EQUAL);

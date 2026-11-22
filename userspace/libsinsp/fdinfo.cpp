@@ -46,6 +46,53 @@ static void set_ipv6_addr_high(ipv6addr& a,
 };
 
 template<typename SyncPolicy>
+bool sinsp_fdinfo_impl<SyncPolicy>::content_equals(const sinsp_fdinfo_impl& other) const {
+	// Only used right after the initial /proc scan (single-threaded), so the entries are compared
+	// field by field without taking a consistent seqlock snapshot.
+	if(load_relaxed(m_type) != load_relaxed(other.m_type) ||
+	   load_relaxed(m_openflags) != load_relaxed(other.m_openflags) ||
+	   load_relaxed(m_flags) != load_relaxed(other.m_flags) ||
+	   load_relaxed(m_dev) != load_relaxed(other.m_dev) ||
+	   load_relaxed(m_mount_id) != load_relaxed(other.m_mount_id) ||
+	   load_relaxed(m_ino) != load_relaxed(other.m_ino) ||
+	   load_relaxed(m_pid) != load_relaxed(other.m_pid) ||
+	   load_relaxed(m_fd) != load_relaxed(other.m_fd) || get_name() != other.get_name() ||
+	   get_name_raw() != other.get_name_raw()) {
+		return false;
+	}
+
+	// Only the union member selected by m_type is meaningful; the tuple
+	// unions expose their bytes (m_all), the server infos are compared
+	// field by field to avoid padding.
+	switch(load_relaxed(m_type)) {
+	case SCAP_FD_IPV4_SOCK:
+		return memcmp(m_sockinfo.m_ipv4info.m_all,
+		              other.m_sockinfo.m_ipv4info.m_all,
+		              sizeof(m_sockinfo.m_ipv4info.m_all)) == 0;
+	case SCAP_FD_IPV6_SOCK:
+		return memcmp(m_sockinfo.m_ipv6info.m_all,
+		              other.m_sockinfo.m_ipv6info.m_all,
+		              sizeof(m_sockinfo.m_ipv6info.m_all)) == 0;
+	case SCAP_FD_UNIX_SOCK:
+		return memcmp(m_sockinfo.m_unixinfo.m_all,
+		              other.m_sockinfo.m_unixinfo.m_all,
+		              sizeof(m_sockinfo.m_unixinfo.m_all)) == 0;
+	case SCAP_FD_IPV4_SERVSOCK: {
+		const auto& a = m_sockinfo.m_ipv4serverinfo;
+		const auto& b = other.m_sockinfo.m_ipv4serverinfo;
+		return a.m_ip == b.m_ip && a.m_port == b.m_port && a.m_l4proto == b.m_l4proto;
+	}
+	case SCAP_FD_IPV6_SERVSOCK: {
+		const auto& a = m_sockinfo.m_ipv6serverinfo;
+		const auto& b = other.m_sockinfo.m_ipv6serverinfo;
+		return a.m_ip == b.m_ip && a.m_port == b.m_port && a.m_l4proto == b.m_l4proto;
+	}
+	default:
+		return true;
+	}
+}
+
+template<typename SyncPolicy>
 char sinsp_fdinfo_impl<SyncPolicy>::get_typechar() const {
 	switch(load_relaxed(m_type)) {
 	case SCAP_FD_FILE_V2:
@@ -216,27 +263,6 @@ sinsp_fdinfo_impl<SyncPolicy>::get_static_fields() {
 		        std::atomic_store(&c->m_name_raw,
 		                          std::make_shared<const std::string>(std::move(val)));
 	        });
-	libsinsp::state::define_static_field<std::string>(
-	        ret,
-	        "old_name",
-	        [](const void* in, size_t) -> libsinsp::state::borrowed_state_data {
-		        auto c = static_cast<const self*>(in);
-		        auto p = std::atomic_load(&c->m_oldname);
-		        if(p) {
-			        return libsinsp::state::borrowed_state_data::from<SS_PLUGIN_ST_STRING,
-			                                                          std::string>(*p);
-		        }
-		        static const std::string s_empty;
-		        return libsinsp::state::borrowed_state_data::from<SS_PLUGIN_ST_STRING, std::string>(
-		                s_empty);
-	        },
-	        [](void* in, size_t, const libsinsp::state::borrowed_state_data& in_data) {
-		        auto c = static_cast<self*>(in);
-		        std::string val;
-		        in_data.copy_to<SS_PLUGIN_ST_STRING, std::string>(val);
-		        std::atomic_store(&c->m_oldname,
-		                          std::make_shared<const std::string>(std::move(val)));
-	        });
 	DEFINE_STATIC_FIELD(ret, self, m_flags, "flags");
 	DEFINE_STATIC_FIELD(ret, self, m_dev, "dev");
 	DEFINE_STATIC_FIELD(ret, self, m_mount_id, "mount_id");
@@ -344,11 +370,9 @@ sinsp_fdinfo_impl<SyncPolicy>::get_static_fields() {
 }
 
 template<typename SyncPolicy>
-std::string sinsp_fdinfo_impl<SyncPolicy>::tostring_clean() const {
+std::string sinsp_fdinfo_impl<SyncPolicy>::tostring() const {
 	auto p = std::atomic_load(&m_name);
-	std::string tstr = p ? *p : std::string{};
-	std::string storage;
-	return std::string(sanitize_string(tstr, storage));
+	return p ? *p : std::string{};
 }
 
 template<typename SyncPolicy>

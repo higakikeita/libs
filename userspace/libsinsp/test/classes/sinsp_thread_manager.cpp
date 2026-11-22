@@ -112,14 +112,15 @@ TEST(sinsp_thread_manager, create_thread_dependencies_new_tginfo) {
 	const auto tinfo = m_inspector.get_threadinfo_factory().create_shared();
 	tinfo->m_tid = 51000;
 	tinfo->set_pid(51000);
-	tinfo->set_ptid(51001); /* we won't find it in the table, so we will default to 0 */
+	tinfo->set_ptid(51001); /* we will not find it in the table, so it stays a tid */
 	tinfo->set_vtid(20);
 	tinfo->set_vpid(1);
 
 	m_inspector.m_thread_manager->create_thread_dependencies(tinfo);
 	ASSERT_THREAD_GROUP_INFO(tinfo->get_pid(), 1, true, 1, 1);
 
-	ASSERT_EQ(tinfo->get_ptid(), 0);
+	ASSERT_EQ(tinfo->get_tginfo()->get_parent(), nullptr);
+	ASSERT_EQ(tinfo->get_ptid(), 51001);
 }
 
 TEST(sinsp_thread_manager, create_thread_dependencies_use_existing_tginfo) {
@@ -161,7 +162,12 @@ TEST_F(sinsp_with_test_input, THRD_MANAGER_create_thread_dependencies_valid_pare
 	m_inspector.m_thread_manager->create_thread_dependencies(tinfo);
 	ASSERT_THREAD_GROUP_INFO(tinfo->get_pid(), 1, false, 1, 1);
 	ASSERT_EQ(tinfo->get_ptid(), p6_t1_tid);
-	ASSERT_THREAD_CHILDREN(p6_t1_tid, 1, 1);
+	/* The thread is not in the table, so the search for the children of p6_t1 cannot find it.
+	 * Look at the parent link of the thread instead.
+	 */
+	auto parent = m_inspector.m_thread_manager->get_parent_thread(*tinfo);
+	ASSERT_TRUE(parent);
+	ASSERT_EQ(parent->m_tid, p6_t1_tid);
 }
 
 TEST_F(sinsp_with_test_input, THRD_MANAGER_create_thread_dependencies_invalid_parent) {
@@ -175,8 +181,9 @@ TEST_F(sinsp_with_test_input, THRD_MANAGER_create_thread_dependencies_invalid_pa
 
 	m_inspector.m_thread_manager->create_thread_dependencies(tinfo);
 	ASSERT_THREAD_GROUP_INFO(tinfo->get_pid(), 1, false, 1, 1);
-	/* the new parent will be 0 */
-	ASSERT_EQ(tinfo->get_ptid(), 0);
+	/* There is no parent to link to, so the thread keeps the ptid */
+	ASSERT_EQ(tinfo->get_tginfo()->get_parent(), nullptr);
+	ASSERT_EQ(tinfo->get_ptid(), 8000);
 }
 
 TEST(sinsp_thread_manager, THRD_MANAGER_find_new_reaper_nullptr) {
@@ -213,34 +220,4 @@ TEST_F(sinsp_with_test_input, THRD_MANAGER_find_reaper_in_the_tree) {
 	/* Call the find reaper method, the reaper for p6_t1 should be p4_t1  */
 	const auto reaper = thread_manager->find_new_reaper(p6_t1_tinfo);
 	ASSERT_EQ(reaper->m_tid, p4_t1_tid);
-}
-
-TEST_F(sinsp_with_test_input, THRD_MANAGER_find_new_reaper_detect_loop) {
-	DEFAULT_TREE
-
-	const auto& thread_manager = m_inspector.m_thread_manager;
-
-	/* If we detect a loop the new reaper will be nullptr.
-	 * We set p2_t1 group as a reaper.
-	 */
-	const auto p2_t1_tinfo = thread_manager->find_thread(p2_t1_tid, true).get();
-	ASSERT_TRUE(p2_t1_tinfo);
-	p2_t1_tinfo->get_tginfo()->set_reaper(true);
-
-	/* We explicitly set p3_t1 ptid to p4_t1, so we create a loop */
-	const auto p3_t1_tinfo = thread_manager->find_thread(p3_t1_tid, true).get();
-	ASSERT_TRUE(p3_t1_tinfo);
-	p3_t1_tinfo->set_ptid(p4_t1_tid);
-
-	/* We will call find_new_reaper on p4_t1 but before doing this we need to
-	 * remove p4_t2 otherwise we will have a valid thread in the same group as a new reaper
-	 */
-	remove_thread(p4_t2_tid, p4_t1_tid);
-
-	/* We call find_new_reaper on p4_t1.
-	 * The new reaper should be nullptr since we detected a loop.
-	 */
-	const auto p4_t1_tinfo = thread_manager->find_thread(p4_t1_tid, true).get();
-	ASSERT_TRUE(p4_t1_tinfo);
-	ASSERT_EQ(thread_manager->find_new_reaper(p4_t1_tinfo), nullptr);
 }

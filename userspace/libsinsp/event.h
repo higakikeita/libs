@@ -443,15 +443,54 @@ public:
 	*/
 	inline const sinsp_fdinfo* get_fd_info() const { return m_fdinfo_ref.get(); }
 
-	inline sinsp_fdinfo* get_fd_info() { return m_fdinfo_ref.get(); }
+	// Mutable access to the event's fd entry: the acquisition point where
+	// copy-on-write will detach an entry shared with other fd tables. The
+	// entry's name is snapshotted on the first acquisition per event, so
+	// that fdinfo_name_changed() can detect changes made while parsing.
+	//
+	// The parse path stores a *read-only* reference to the fd entry (see
+	// set_fd_info / sinsp_parser::reset), so events that only read the entry
+	// never detach a shared copy. The detach is performed lazily here, the
+	// first time a consumer actually asks for writable access.
+	inline sinsp_fdinfo* get_fd_info_mut() {
+		if(m_fdinfo_ref && !m_fdinfo_writable) {
+			// May replace m_fdinfo_ref with a private (copy-on-write-detached)
+			// entry. Out-of-line because it needs the full sinsp_threadinfo
+			// definition, only forward-declared here.
+			upgrade_fd_info_writable();
+			m_fdinfo_writable = true;
+		}
+		if(m_fdinfo_ref && !m_fdinfo_name_snapshot_valid) {
+			m_fdinfo_name_snapshot = m_fdinfo_ref->get_name();
+			m_fdinfo_name_snapshot_valid = true;
+		}
+		return m_fdinfo_ref.get();
+	}
 
-	inline void set_fd_info(std::shared_ptr<sinsp_fdinfo> v) { m_fdinfo_ref = std::move(v); }
+	// The stored reference is treated as read-only until the first
+	// get_fd_info_mut() call detaches a private copy; the const_cast is sound
+	// for that reason (see get_fd_info_mut()).
+	inline void set_fd_info(std::shared_ptr<const sinsp_fdinfo> v) {
+		if(v != m_fdinfo_ref) {
+			m_fdinfo_name_snapshot_valid = false;
+		}
+		m_fdinfo_writable = false;
+		m_fdinfo_ref = std::const_pointer_cast<sinsp_fdinfo>(std::move(v));
+	}
 
-	inline void set_fd_info(std::nullptr_t) { m_fdinfo_ref.reset(); }
+	inline void set_fd_info(std::nullptr_t) {
+		m_fdinfo_name_snapshot_valid = false;
+		m_fdinfo_writable = false;
+		m_fdinfo_ref.reset();
+	}
 
-	bool fdinfo_name_changed() const { return m_fdinfo_name_changed; }
-
-	void set_fdinfo_name_changed(const bool changed) { m_fdinfo_name_changed = changed; }
+	// True if parsing the current event changed the name of the (pre-existing)
+	// fd the event refers to. Events that never modified their fd, and fds
+	// created by the current event, report false.
+	bool fdinfo_name_changed() const {
+		return m_fdinfo_ref != nullptr && m_fdinfo_name_snapshot_valid &&
+		       m_fdinfo_ref->get_name() != m_fdinfo_name_snapshot;
+	}
 
 	/*!
 	  \brief Return the number of the FD associated with this event.
@@ -559,8 +598,6 @@ public:
 	void set_iosize(uint32_t size);
 	uint32_t get_iosize() const;
 
-	std::string get_base_dir(uint32_t id, sinsp_threadinfo*);
-
 	/*!
 	  \param resolved_str [out] the string representation of the parameter
 	*/
@@ -580,7 +617,8 @@ public:
 		m_info = &m_event_info_table[m_pevt->type];
 		m_tinfo_ref.reset();
 		m_fdinfo_ref.reset();
-		m_fdinfo_name_changed = false;
+		m_fdinfo_name_snapshot_valid = false;
+		m_fdinfo_writable = false;
 		m_iosize = 0;
 		m_source_idx = sinsp_no_event_source_idx;
 		m_source_name = sinsp_no_event_source_name;
@@ -591,7 +629,8 @@ public:
 		m_info = &m_event_info_table[m_pevt->type];
 		m_tinfo_ref.reset();
 		m_fdinfo_ref.reset();
-		m_fdinfo_name_changed = false;
+		m_fdinfo_name_snapshot_valid = false;
+		m_fdinfo_writable = false;
 		m_iosize = 0;
 		m_cpuid = cpuid;
 		m_source_idx = sinsp_no_event_source_idx;
@@ -664,7 +703,7 @@ public:
 
 	const std::shared_ptr<sinsp_fdinfo>& get_fdinfo_ref() { return m_fdinfo_ref; }
 
-	void set_fdinfo_ref(const std::shared_ptr<sinsp_fdinfo>& v) { m_fdinfo_ref = v; }
+	void set_fdinfo_ref(const std::shared_ptr<sinsp_fdinfo>& v) { set_fd_info(v); }
 
 	const std::vector<char>& get_paramstr_storage() const { return m_paramstr_storage; }
 
@@ -765,7 +804,15 @@ public:
 
 private:
 	char* render_fd(int64_t fd, const char** resolved_str, param_fmt fmt);
-	int render_fd_json(Json::Value* ret, int64_t fd, const char** resolved_str, param_fmt fmt);
+	std::string get_base_dir(uint32_t id, sinsp_threadinfo*);
+	void write_sockaddr_param_to_storage(std::vector<char>& storage,
+	                                     const sinsp_evt_param& param) const;
+	void write_socktuple_param_to_storage(std::vector<char>& storage,
+	                                      const sinsp_evt_param& param) const;
+
+	// Detach a private (copy-on-write) copy of m_fdinfo from the owning fd
+	// table, replacing m_fdinfo with it. Called lazily by get_fd_info_mut.
+	void upgrade_fd_info_writable();
 
 	sinsp* m_inspector;
 	scap_evt* m_pevt;
@@ -785,9 +832,19 @@ private:
 	// info it should either be null, or point to the same place as m_tinfo
 	std::shared_ptr<sinsp_threadinfo> m_tinfo_ref;
 
-	// If true, then the associated fdinfo changed names as a part
-	// of parsing this event.
-	bool m_fdinfo_name_changed;
+	// Name of the event's fd at its first writable acquisition, against which
+	// fdinfo_name_changed() detects a rename during parsing. The string is reused
+	// across events, so validity is tracked separately -- and it is keyed on the
+	// fd pointer: set_fd_info() invalidates the snapshot whenever m_fdinfo
+	// changes, so anything that installs a different fd on the event mid-event
+	// also clears the name-change answer for it.
+	std::string m_fdinfo_name_snapshot;
+	bool m_fdinfo_name_snapshot_valid;
+
+	// True once get_fd_info_mut() has detached a private copy of m_fdinfo
+	// for this event; while false, m_fdinfo is a read-only (possibly shared)
+	// reference. Reset whenever m_fdinfo changes.
+	bool m_fdinfo_writable = false;
 
 	uint32_t m_iosize;
 	int32_t m_errorcode;

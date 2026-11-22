@@ -47,10 +47,10 @@ scap_userlist* scap_get_user_list(struct scap_platform* platform) {
 }
 
 uint32_t scap_get_device_by_mount_id(struct scap_platform* platform,
-                                     const char* procdir,
-                                     unsigned long requested_mount_id) {
+                                     const int64_t tid,
+                                     const unsigned long requested_mount_id) {
 	if(platform && platform->m_vtable->get_device_by_mount_id) {
-		return platform->m_vtable->get_device_by_mount_id(platform, procdir, requested_mount_id);
+		return platform->m_vtable->get_device_by_mount_id(platform, tid, requested_mount_id);
 	}
 
 	return 0;
@@ -152,6 +152,21 @@ int32_t scap_get_fdinfo(struct scap_platform* platform,
                         char* error) {
 	if(platform && platform->m_vtable->get_fdinfo) {
 		return platform->m_vtable->get_fdinfo(platform, tinfo, fd, error);
+	}
+
+	return scap_err_opnotsup(error);
+}
+
+int32_t scap_get_file_path(struct scap_platform* platform,
+                           const int64_t pid,
+                           const int64_t fd,
+                           char* path_buff,
+                           const size_t path_buff_len,
+                           size_t* path_len,
+                           char* error) {
+	if(platform && platform->m_vtable->get_file_path) {
+		return platform->m_vtable
+		        ->get_file_path(platform, pid, fd, path_buff, path_buff_len, path_len, error);
 	}
 
 	return scap_err_opnotsup(error);

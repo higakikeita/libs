@@ -15,16 +15,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 */
-
 #pragma once
 
+#include <atomic>
+#include <functional>
 #include <memory>
-#include <stdint.h>
-#include <list>
 #include <mutex>
 #include <shared_mutex>
+#include <stdint.h>
+#include <list>
 
 #include <libsinsp/sinsp_exception.h>
+#include <libsinsp/sinsp_public.h>
 #include <libsinsp/sync_policy.h>
 
 template<typename SyncPolicy>
@@ -38,10 +40,29 @@ using sinsp_threadinfo = sinsp_threadinfo_impl<sync_policy_default>;
 #define DEFAULT_DEAD_THREADS_THRESHOLD 11
 
 /* New struct that keep information regarding the thread group.
- * All access to m_threads, m_alive_count, m_reaper is protected by m_mutex for thread safety.
+ * All access to m_threads, m_alive_count, m_reaper and the parent link (m_parent, m_parent_tid,
+ * m_dead, m_link_refused) is protected by m_mutex for thread safety. The rank is atomic, so that a
+ * group can read the rank of another one without nesting locks: the parent links go down in rank,
+ * thus locks taken child-then-parent can never form a cycle.
  */
 struct thread_group_info {
 public:
+	/* An entry of the thread list of the group. The thread table owns the threads. In the
+	 * multi-thread build another worker may erase a thread at any time, so readers always take a
+	 * reference with lock().
+	 */
+	class thread_ref {
+	public:
+		thread_ref(const std::shared_ptr<sinsp_threadinfo>& thread): m_weak(thread) {}
+		thread_ref(const std::weak_ptr<sinsp_threadinfo>& thread): m_weak(thread) {}
+
+		inline bool expired() const { return m_weak.expired(); }
+		inline std::shared_ptr<sinsp_threadinfo> lock() const { return m_weak.lock(); }
+
+	private:
+		std::weak_ptr<sinsp_threadinfo> m_weak;
+	};
+
 	thread_group_info(int64_t group_pid,
 	                  bool reaper,
 	                  std::weak_ptr<sinsp_threadinfo> current_thread):
@@ -97,7 +118,7 @@ public:
 
 	/** Returns a copy of the thread list so the result is safe to use after the lock is released.
 	 */
-	inline std::list<std::weak_ptr<sinsp_threadinfo>> get_thread_list() const {
+	inline std::list<thread_ref> get_thread_list() const {
 		std::shared_lock lock(m_mutex);
 		return m_threads;
 	}
@@ -169,6 +190,7 @@ public:
 		}
 	}
 
+	/* A tombstone has no threads, so the list can be empty. */
 	inline std::shared_ptr<sinsp_threadinfo> get_first_thread() const {
 		std::shared_lock lock(m_mutex);
 		if(m_threads.empty()) {
@@ -176,6 +198,149 @@ public:
 		}
 		return m_threads.front().lock();
 	}
+
+	/* The parent process is the group of the thread that forked, and the tid of that thread.
+	 * Only the child side of the link is stored. The parent keeps no list of children.
+	 *
+	 * The writer resolves the link when it writes it, and readers only follow it. A null link
+	 * with a tid is a parent that we do not know (yet).
+	 *
+	 * Every link goes down in rank, so the links never form a cycle. The rank of a group is set
+	 * before anything can link to the group, and it never changes. The rank is the rank of the
+	 * parent plus one, 0 without a parent, and s_unknown_parent_rank when the parent is unknown.
+	 * The high rank lets sinsp link the group to its parent later. A link to a group of the same
+	 * rank or higher is refused. Thus, the test of a link needs only the two groups.
+	 */
+	static constexpr uint64_t s_unknown_parent_rank = uint64_t{1} << 62;
+
+	/* Link a group that nothing links to yet, and set its rank. If the rank of the parent is
+	 * pending (also when the parent is this group), the link is refused. Then the function keeps
+	 * the tid and returns false.
+	 */
+	inline bool link_new(std::shared_ptr<thread_group_info> parent, int64_t parent_tid) {
+		std::unique_lock lock(m_mutex);
+		if(parent != nullptr && parent->get_rank() != s_pending_rank) {
+			m_rank.store(parent->get_rank() + 1);
+			m_parent = std::move(parent);
+			m_parent_tid = parent_tid;
+			return true;
+		}
+		m_rank.store(parent_tid > 0 ? s_unknown_parent_rank : 0);
+		m_parent = nullptr;
+		m_parent_tid = parent_tid;
+		return parent == nullptr;
+	}
+
+	/* Use this for a group that is published before it is linked, because the /proc scan creates
+	 * its parent first. Nothing can link to the group until link_new() sets its rank.
+	 */
+	inline void set_rank_pending() { m_rank.store(s_pending_rank); }
+
+	/* Link to `parent` unless that link goes up in rank. A refused link stores nothing. */
+	inline bool relink(std::shared_ptr<thread_group_info> parent, int64_t parent_tid) {
+		std::unique_lock lock(m_mutex);
+		if(parent->get_rank() >= m_rank.load()) {
+			return false;
+		}
+		m_parent = std::move(parent);
+		m_parent_tid = parent_tid;
+		m_link_refused = false;
+		return true;
+	}
+
+	/* Drop the link to the group of the parent, but keep the parent tid. */
+	inline void unlink(int64_t parent_tid) {
+		std::unique_lock lock(m_mutex);
+		m_parent = nullptr;
+		m_parent_tid = parent_tid;
+		m_link_refused = false;
+	}
+
+	/* The link to `m_parent_tid` was refused, so sinsp does not try it again. */
+	inline void set_link_refused() {
+		std::unique_lock lock(m_mutex);
+		m_link_refused = true;
+	}
+
+	/* True if a link to the parent known only by its tid is still to be tried. */
+	inline bool awaits_parent() const {
+		std::shared_lock lock(m_mutex);
+		return m_parent == nullptr && m_parent_tid > 0 && !m_link_refused && !m_dead;
+	}
+
+	inline uint64_t get_rank() const { return m_rank.load(); }
+
+	/* The parent group is returned by value: another worker may relink the group at any time. */
+	inline std::shared_ptr<thread_group_info> get_parent() const {
+		std::shared_lock lock(m_mutex);
+		return m_parent;
+	}
+
+	inline int64_t get_parent_tid() const {
+		std::shared_lock lock(m_mutex);
+		return m_parent_tid;
+	}
+
+	/* True if the chain of parent links ends (has no cycle). For asserts and tests only. */
+	inline bool chain_ends() const {
+		uint64_t steps = 0;
+		for(auto cur = get_parent(); cur != nullptr; cur = cur->get_parent()) {
+			if(++steps > (uint64_t{1} << 24)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/* A dead group is a tombstone (a group that stays after its process is gone). It leaves the
+	 * group table with its last thread, and it lives while a child links to it. sinsp picks the
+	 * reaper when the group dies, and the reaper replaces the parent link. If sinsp finds no
+	 * reaper, the link is empty, and the children of the tombstone have no parent. The link of a
+	 * tombstone never changes.
+	 */
+	inline void set_dead() {
+		std::unique_lock lock(m_mutex);
+		m_dead = true;
+		m_threads.clear();
+	}
+
+	/* For a dying group: link to its reaper, unless that link goes up in rank. */
+	inline bool link_reaper(std::shared_ptr<thread_group_info> reaper, int64_t reaper_tid) {
+		std::unique_lock lock(m_mutex);
+		if(reaper->get_rank() >= m_rank.load()) {
+			return false;
+		}
+		m_parent = std::move(reaper);
+		m_parent_tid = reaper_tid;
+		return true;
+	}
+
+	inline bool is_dead() const {
+		std::shared_lock lock(m_mutex);
+		return m_dead;
+	}
+
+	/* Link straight to `parent`, where the dead parent `seen` leads. The tombstones in between
+	 * are freed when nothing links to them. If the link is no longer `seen`, nothing is stored,
+	 * so a relink in between wins.
+	 */
+	inline void skip_dead_parent(const thread_group_info* seen,
+	                             std::shared_ptr<thread_group_info> parent,
+	                             int64_t parent_tid) {
+		ASSERT(parent->get_rank() < m_rank.load());
+		before_shortcut_store();
+		std::unique_lock lock(m_mutex);
+		if(m_parent.get() != seen) {
+			return;
+		}
+		m_parent = std::move(parent);
+		m_parent_tid = parent_tid;
+	}
+
+#ifdef _DEBUG
+	/* Tests only: called between the walk and the store of a shortcut. */
+	static inline std::function<void()> s_before_shortcut_store;
+#endif
 
 private:
 	/** Called with m_mutex already held (unique_lock). */
@@ -190,9 +355,24 @@ private:
 		}
 	}
 
+	inline void before_shortcut_store() const {
+#ifdef _DEBUG
+		if(s_before_shortcut_store) {
+			s_before_shortcut_store();
+		}
+#endif
+	}
+
+	static constexpr uint64_t s_pending_rank = UINT64_MAX;
+
 	int64_t m_pid; /* unsigned if we want to use `-1` as an invalid value */
 	mutable std::shared_mutex m_mutex;
 	uint64_t m_alive_count;
-	std::list<std::weak_ptr<sinsp_threadinfo>> m_threads;
+	std::list<thread_ref> m_threads;
+	std::shared_ptr<thread_group_info> m_parent;
+	int64_t m_parent_tid = 0;
+	std::atomic<uint64_t> m_rank{s_unknown_parent_rank};
 	bool m_reaper;
+	bool m_dead = false;
+	bool m_link_refused = false;
 };

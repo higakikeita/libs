@@ -18,8 +18,6 @@ limitations under the License.
 
 #pragma once
 
-#define DEFAULT_EXPIRED_CHILDREN_THRESHOLD 10
-
 #ifdef _WIN32
 struct iovec {
 	void* iov_base; /* Starting address */
@@ -46,7 +44,10 @@ struct erase_fd_params {
 	bool m_remove_from_table;
 	int64_t m_fd;
 	sinsp_threadinfo* m_tinfo;
-	sinsp_fdinfo* m_fdinfo;
+	// Read-only view of the fd being erased. A consumer that needs to modify
+	// the entry (e.g. finalizing a transaction on a socket) re-fetches a
+	// writable copy-on-write copy via m_tinfo->get_fd_mut(m_fd).
+	const sinsp_fdinfo* m_fdinfo;
 };
 
 /** @defgroup state State management
@@ -58,12 +59,15 @@ struct erase_fd_params {
   An instance of this struct is meant to be shared among all sinsp_threadinfo instances.
 */
 struct sinsp_threadinfo_ctor_params {
-	// The following fields are externally provided and access to them is expected to be
-	// read-only.
+	// The following fields are externally provided and access to them is expected to be read-only.
 	const sinsp_network_interfaces& network_interfaces;
 	const sinsp_fdinfo_factory& fdinfo_factory;
 	const sinsp_fdtable_factory& fdtable_factory;
 	const std::shared_ptr<libsinsp::state::dynamic_field_infos>& thread_manager_dyn_fields;
+	scap_platform* const& scap_plat;
+	// The following fields are externally provided and expected to be populated/updated by the
+	// threadinfo logic.
+	char* scap_plat_lasterr;
 };
 
 /*!
@@ -232,14 +236,6 @@ public:
 		return m_tginfo->get_thread_count();
 	}
 
-	/*
-	  \brief returns true if there is a loop detected in the thread parent state.
-	  Needs traverse_parent_state() to have been called first.
-	*/
-	inline bool parent_loop_detected() const { return m_parent_loop_detected; }
-
-	inline void set_parent_loop_detected(bool v) { m_parent_loop_detected = v; }
-
 	/*!
 	  \brief Get the main thread of the process containing this thread.
 
@@ -272,6 +268,20 @@ public:
 	}
 
 	/*!
+	  \brief Get the main thread of the process containing this thread, or this thread if sinsp
+	  does not know the main thread. Use it for the state that sinsp keeps on the main thread.
+	*/
+	inline std::shared_ptr<sinsp_threadinfo_impl> get_main_thread_or_self() {
+		auto mt = get_main_thread();
+		return mt != nullptr ? mt
+		                     : std::shared_ptr<sinsp_threadinfo_impl>(std::shared_ptr<void>{}, this);
+	}
+
+	inline std::shared_ptr<const sinsp_threadinfo_impl> get_main_thread_or_self() const {
+		return const_cast<sinsp_threadinfo_impl*>(this)->get_main_thread_or_self();
+	}
+
+	/*!
 	  \brief Retrieve information about one of this thread/process FDs.
 
 	  \param fd The file descriptor number, e.g. 0 for stdin.
@@ -279,15 +289,30 @@ public:
 	  \return Pointer to the FD information, or NULL if the given FD doesn't
 	   exist
 	*/
-	inline std::shared_ptr<sinsp_fdinfo> get_fd(int64_t fd) {
+	// Read-only fd lookup: never detaches a copy-on-write-shared entry. This is
+	// the default; a caller that will modify the entry must use
+	// get_fd_mut() (or sinsp_evt::get_fd_info_mut()). Writing through
+	// an entry obtained here would corrupt entries still shared with other fd
+	// tables.
+	inline std::shared_ptr<const sinsp_fdinfo_impl<SyncPolicy>> get_fd(int64_t fd) const {
+		if(fd < 0) {
+			return nullptr;
+		}
+		const auto* fdt = get_fd_table();
+		return (fdt != nullptr) ? fdt->find(fd) : nullptr;
+	}
+
+	// Writable fd lookup: detaches a private copy-on-write copy of a shared
+	// entry so the caller may modify it in place.
+	inline std::shared_ptr<sinsp_fdinfo_impl<SyncPolicy>> get_fd_mut(int64_t fd) {
 		if(fd < 0) {
 			return nullptr;
 		}
 
-		sinsp_fdtable* fdt = get_fd_table();
+		auto* fdt = get_fd_table_mut();
 
 		if(fdt) {
-			auto fdinfo = fdt->find(fd);
+			auto fdinfo = fdt->find_mut(fd);
 			if(fdinfo) {
 				return fdinfo;
 			}
@@ -344,64 +369,39 @@ public:
 	 */
 	bool get_cgroup(const std::string& subsys, std::string& cgroup) const;
 
-	void report_thread_loop(const sinsp_threadinfo_impl& looping_thread);
+	/*!
+	  \brief Return the tid of this thread's parent, following a dead parent to its reaper: the
+	  stored tid if the parent is not linked, 0 if a dead parent's reaper is not found.
+	*/
+	int64_t get_ptid() const;
 
-	void assign_children_to_reaper(sinsp_threadinfo_impl* reaper);
+	/*!
+	  \brief Set the parent tid of a thread not in a group yet. Throws once it is: the parent is
+	  then the group's link.
+	*/
+	void set_ptid(int64_t ptid);
 
-	inline void add_child(const std::shared_ptr<sinsp_threadinfo_impl>& child) {
-		std::unique_lock lock(m_children_mutex);
-		m_children.push_front(child);
-		child->set_ptid(m_tid);
-		m_not_expired_children++;
-	}
+	/*!
+	  \brief Return this thread's parent, following dead parents to their reapers, or nullptr.
+	  The thread must have a group.
+	*/
+	std::shared_ptr<sinsp_threadinfo_impl> get_linked_parent() const;
 
-	inline void remove_child_from_list(const std::shared_ptr<sinsp_threadinfo_impl>& child) {
-		std::unique_lock lock(m_children_mutex);
-		remove_child_from_list_unlocked(child);
-	}
+	/*!
+	  \brief Mark the thread as removed by the thread manager. A main thread stays in the table
+	  while its group lives, so its presence in the table does not show if it is removed.
+	*/
+	inline void set_removed() { store_relaxed(m_removed, true); }
 
-	inline void remove_child_and_maybe_clean(const std::shared_ptr<sinsp_threadinfo_impl>& child) {
-		std::unique_lock lock(m_children_mutex);
-		remove_child_from_list_unlocked(child);
-		if((m_children.size() - m_not_expired_children) >= DEFAULT_EXPIRED_CHILDREN_THRESHOLD) {
-			clean_expired_children_unlocked();
-		}
-	}
-
-	inline void clean_expired_children() {
-		std::unique_lock lock(m_children_mutex);
-		clean_expired_children_unlocked();
-	}
-
-	inline bool has_children() const {
-		std::unique_lock lock(m_children_mutex);
-		return !m_children.empty();
-	}
-
-	template<typename F>
-	inline void for_each_child(F&& fn) {
-		std::unique_lock lock(m_children_mutex);
-		for(auto& child : m_children) {
-			if(auto ptr = child.lock()) {
-				fn(ptr);
-			}
-		}
-	}
-
-	inline void set_not_expired_children(uint64_t v) { m_not_expired_children = v; }
-
-	inline uint64_t get_not_expired_children() const { return m_not_expired_children; }
-
-	inline size_t get_children_count() const {
-		std::unique_lock lock(m_children_mutex);
-		return m_children.size();
-	}
+	inline bool is_removed() const { return load_relaxed(m_removed); }
 
 	static void populate_cmdline(std::string& cmdline, const sinsp_threadinfo_impl* tinfo);
 	static void populate_args(std::string& args, const sinsp_threadinfo_impl* tinfo);
 
 	/*!
-	  \brief Translate a directory's file descriptor into its path
+	  \brief Translate a directory's file descriptor into its path.
+
+	  The returned path is terminated with a trailing slash.
 	  \param dir_fd  A file descriptor for a directory
 	  \return  A path (or "" if failure)
 	 */
@@ -419,8 +419,6 @@ public:
 	// --- Atomic identity getters/setters ---
 	inline int64_t get_pid() const { return load_relaxed(m_pid); }
 	inline void set_pid(int64_t v) { store_relaxed(m_pid, v); }
-	inline int64_t get_ptid() const { return load_relaxed(m_ptid); }
-	inline void set_ptid(int64_t v) { store_relaxed(m_ptid, v); }
 	inline int64_t get_reaper_tid() const { return load_relaxed(m_reaper_tid); }
 	inline void set_reaper_tid(int64_t v) { store_relaxed(m_reaper_tid, v); }
 	inline int64_t get_sid() const { return load_relaxed(m_sid); }
@@ -592,17 +590,19 @@ public:
 	/* Note that `fd_table` should be shared with the main thread only if `PPM_CL_CLONE_FILES`
 	 * is specified. Today we always specify `PPM_CL_CLONE_FILES` for all threads.
 	 */
-	inline sinsp_fdtable_impl<SyncPolicy>* get_fd_table() {
+	inline const sinsp_fdtable_impl<SyncPolicy>* get_fd_table() const {
 		if(!(load_relaxed(m_flags) & PPM_CL_CLONE_FILES)) {
 			return &m_fdtable;
-		} else {
-			auto root = get_main_thread();
-			return (root == nullptr) ? nullptr : &(root->get_fdtable());
 		}
+		auto root = get_main_thread();
+		return (root == nullptr) ? nullptr : &(root->get_fdtable());
 	}
 
-	inline const sinsp_fdtable_impl<SyncPolicy>* get_fd_table() const {
-		return const_cast<sinsp_threadinfo_impl*>(this)->get_fd_table();
+	// Table access for modification: the chokepoint where copy-on-write
+	// will detach state shared with other processes' fd tables. Same
+	// CLONE_FILES routing as the const accessor, so delegate to it.
+	inline sinsp_fdtable_impl<SyncPolicy>* get_fd_table_mut() {
+		return const_cast<sinsp_fdtable_impl<SyncPolicy>*>(get_fd_table());
 	}
 
 	void init();
@@ -682,31 +682,6 @@ protected:
 	// ctor_params object in sinsp constructor.
 	const std::shared_ptr<ctor_params> m_params;
 
-	inline void remove_child_from_list_unlocked(
-	        const std::shared_ptr<sinsp_threadinfo_impl>& child) {
-		for(auto it = m_children.begin(); it != m_children.end(); ++it) {
-			auto locked = it->lock();
-			if(locked.get() == child.get()) {
-				m_children.erase(it);
-				if(m_not_expired_children > 0) {
-					m_not_expired_children--;
-				}
-				return;
-			}
-		}
-	}
-
-	inline void clean_expired_children_unlocked() {
-		auto child = m_children.begin();
-		while(child != m_children.end()) {
-			if(child->expired()) {
-				child = m_children.erase(child);
-				continue;
-			}
-			child++;
-		}
-	}
-
 private:
 	sinsp_threadinfo_impl* get_cwd_root();
 	bool set_env_from_proc();
@@ -767,11 +742,6 @@ private:
 	// Thread group info (synchronized via std::atomic_load/store)
 	std::shared_ptr<thread_group_info> m_tginfo;
 
-	// Children (synchronized via m_children_mutex)
-	mutable typename traits::thread_children_mutex m_children_mutex;
-	std::list<std::weak_ptr<sinsp_threadinfo_impl>> m_children;
-	uint64_t m_not_expired_children;
-
 	// Internal state
 	sinsp_fdtable_impl<SyncPolicy> m_fdtable;
 	const libsinsp::state::base_table* m_main_fdtable;
@@ -787,15 +757,12 @@ private:
 	uint16_t m_lastevent_type;
 	uint16_t m_lastevent_cpuid;
 	sinsp_evt::category m_lastevent_category;
-	bool m_parent_loop_detected;
+	bool m_removed;
 
 	// State framework table adapters (must come after m_args, m_env, m_cgroups)
 	libsinsp::state::stl_container_table_adapter<decltype(m_args)> m_args_table_adapter;
 	libsinsp::state::stl_container_table_adapter<decltype(m_env)> m_env_table_adapter;
-	libsinsp::state::stl_container_table_adapter<
-	        decltype(m_cgroups),
-	        libsinsp::state::pair_table_entry_adapter<std::string, std::string>>
-	        m_cgroups_table_adapter;
+	libsinsp::state::stl_container_table_adapter<decltype(m_cgroups)> m_cgroups_table_adapter;
 };
 
 using sinsp_threadinfo = sinsp_threadinfo_impl<>;

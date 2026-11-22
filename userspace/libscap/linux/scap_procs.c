@@ -830,7 +830,7 @@ static struct scap_fetch_callbacks linux_vtable_fetch_callbacks(
 static int32_t linux_vtable_fetch_thread(const struct scap_linux_platform* linux_platform,
                                          const struct scap_proclist* proclist,
                                          const int64_t tid,
-                                         scap_threadinfo** tinfo_out,
+                                         scap_threadinfo* tinfo_storage,
                                          char* error) {
 	if(!linux_platform->m_linux_vtable || !linux_platform->m_linux_vtable->fetch_thread) {
 		return SCAP_NOT_SUPPORTED;
@@ -840,7 +840,7 @@ static int32_t linux_vtable_fetch_thread(const struct scap_linux_platform* linux
 	return linux_platform->m_linux_vtable->fetch_thread(linux_platform->m_engine,
 	                                                    &callbacks,
 	                                                    tid,
-	                                                    tinfo_out,
+	                                                    tinfo_storage,
 	                                                    error);
 }
 
@@ -1617,9 +1617,9 @@ int32_t scap_linux_proc_get(struct scap_platform* platform, int64_t tid, bool sc
 		return scap_errprintf(error, 0, "expected positive thread id, got: %ld", tid);
 	}
 
-	// Try to fetch the thread leveraging linux vtable's API.
-	scap_threadinfo* tinfo = NULL;
-	int32_t res = linux_vtable_fetch_thread(linux_platform, proclist, tid, &tinfo, error);
+	scap_threadinfo tinfo_storage;
+	scap_threadinfo* tinfo = &tinfo_storage;
+	int32_t res = linux_vtable_fetch_thread(linux_platform, proclist, tid, tinfo, error);
 	if(res == SCAP_NOT_SUPPORTED) {
 		// Fall back to procfs process lookup.
 		char proc_dir[SCAP_MAX_PATH_SIZE];
@@ -1630,13 +1630,6 @@ int32_t scap_linux_proc_get(struct scap_platform* platform, int64_t tid, bool sc
 	// Do not proceed with file information gathering if we encountered an error.
 	if(res != SCAP_SUCCESS) {
 		return res;
-	}
-
-	if(scap_unlikely(!tinfo)) {
-		return scap_errprintf(
-		        error,
-		        0,
-		        "bug: `linux_vtable_fetch_thread()` didn't populate the threadinfo pointer");
 	}
 
 	// Retrieve files only if this is the main thread.
@@ -1949,4 +1942,33 @@ int32_t scap_linux_get_fdinfo(struct scap_platform* platform,
 		scap_fd_free_ns_sockets_list(&sockets_by_ns);
 	}
 	return res;
+}
+
+int32_t scap_linux_get_file_path(struct scap_platform* platform,
+                                 const int64_t pid,
+                                 const int64_t fd,
+                                 char* path_buff,
+                                 const size_t path_buff_len,
+                                 size_t* path_len,
+                                 char* lasterr) {
+	SCAP_ASSERT_OR_RETURN(pid <= 0, lasterr, 0, "bug: pid must be positive");
+	SCAP_ASSERT_OR_RETURN(fd < 0, lasterr, 0, "bug: fd must be non-negative");
+	SCAP_ASSERT_OR_RETURN(!path_buff, lasterr, 0, "bug: path buffer must be non-NULL");
+	SCAP_ASSERT_OR_RETURN(!path_buff_len, lasterr, 0, "bug: path buffer len must not be zero");
+	SCAP_ASSERT_OR_RETURN(!path_len, lasterr, 0, "bug: path len pointer must non-NULL");
+
+	char filename[SCAP_MAX_PATH_SIZE];
+	snprintf(filename,
+	         sizeof(filename),
+	         "%s/proc/%" PRId64 "/fd/%" PRId64,
+	         scap_get_host_root(),
+	         pid,
+	         fd);
+	const ssize_t bytes_read = readlink(filename, path_buff, path_buff_len - 1);
+	if(bytes_read <= 0) {
+		return scap_errprintf(lasterr, errno, "readlink() failed on %s", filename);
+	}
+	path_buff[bytes_read] = '\0';
+	*path_len = (size_t)bytes_read;
+	return SCAP_SUCCESS;
 }

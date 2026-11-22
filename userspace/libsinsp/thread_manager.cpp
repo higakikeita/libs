@@ -22,6 +22,7 @@ limitations under the License.
 #endif
 #include <stdio.h>
 #include <cinttypes>
+#include <vector>
 #include <libscap/strl.h>
 #include <libsinsp/sinsp.h>
 #include <libsinsp/sinsp_int.h>
@@ -218,48 +219,155 @@ void sinsp_thread_manager_impl<SyncPolicy>::create_thread_dependencies(
 		reaper = true;
 	}
 
-	/* Create the thread group info for the thread. */
+	/* After the thread joins a group, get_ptid() reads the link of the group */
+	const int64_t ptid = tinfo->get_ptid();
+
+	/* A thread of a known process joins its group. The group already has its parent. */
 	auto tginfo = get_thread_group_info(tinfo->get_pid());
-	if(tginfo == nullptr) {
-		tginfo = std::make_shared<thread_group_info>(tinfo->get_pid(), reaper, tinfo);
-		set_thread_group_info(tinfo->get_pid(), tginfo);
-	} else {
+	if(tginfo != nullptr) {
 		tginfo->add_thread_to_group(tinfo, tinfo->is_main_thread());
+		tinfo->set_tginfo(tginfo);
+	} else {
+		link_and_publish_group(
+		        tinfo,
+		        std::make_shared<thread_group_info>(tinfo->get_pid(), reaper, tinfo),
+		        ptid);
 	}
-	tinfo->set_tginfo(tginfo);
 
 	// update fdtable cached pointer for all threads in the group (which includes
 	// the current thread), as their leader might have changed or we simply need
-	// to first initialize it. Then we do the same with the thread's children.
-	tginfo->for_each_thread([](const std::shared_ptr<sinsp_threadinfo>& thread_ptr) {
+	// to first initialize it.
+	tinfo->get_tginfo()->for_each_thread([](const std::shared_ptr<sinsp_threadinfo>& thread_ptr) {
 		thread_ptr->update_main_fdtable();
 		return true;
 	});
-	tinfo->for_each_child([](const std::shared_ptr<sinsp_threadinfo_impl<SyncPolicy>>& child) {
-		child->update_main_fdtable();
-	});
+}
 
-	/* init group has no parent */
-	if(tinfo->get_pid() == 1) {
-		return;
-	}
+/* Log a parent link that the rank check refused. Only bad or missing data asks for one. */
+static void log_refused_parent_link(const char* kind,
+                                    const thread_group_info& group,
+                                    const thread_group_info& parent,
+                                    int64_t parent_tid) {
+	libsinsp_logger()->format(sinsp_logger::SEV_DEBUG,
+	                          "Refused a parent link: pid %" PRId64 " to %s tid %" PRId64
+	                          " (pid %" PRId64 "), the rank of the %s, %" PRIu64
+	                          ", is not below %" PRIu64,
+	                          group.get_tgroup_pid(),
+	                          kind,
+	                          parent_tid,
+	                          parent.get_tgroup_pid(),
+	                          kind,
+	                          parent.get_rank(),
+	                          group.get_rank());
+}
 
-	/* Assign the child to the parent for the first time, we are a thread
-	 * just created and we need to assign us to a parent.
-	 * Remember that in `/proc` scan the `ptid` is `ppid`.
-	 * If we don't find the parent in the table we can do nothing, so we consider
-	 * INIT as the new parent.
-	 * Here we avoid scanning `/proc` to not trigger a possible recursion
-	 * on all the parents
+template<typename SyncPolicy>
+void sinsp_thread_manager_impl<SyncPolicy>::link_and_publish_group(
+        const std::shared_ptr<sinsp_threadinfo_impl<SyncPolicy>>& tinfo,
+        const std::shared_ptr<thread_group_info>& tginfo,
+        const int64_t ptid) {
+	const auto publish = [&] {
+		set_thread_group_info(tinfo->get_pid(), tginfo);
+		tinfo->set_tginfo(tginfo);
+	};
+
+	/* Link the group before it is published. Nothing links to it yet, so the link cannot close
+	 * a loop. In the `/proc` scan, the `ptid` is the `ppid`. If the parent is not in the table,
+	 * the group keeps its tid, and update_parent_link() links it later. sinsp does not scan the
+	 * parent from `/proc`, because that can start a recursion through all the parents. The init
+	 * group has no parent.
 	 */
-	const auto parent_thread = find_thread(tinfo->get_ptid(), true);
-	if(parent_thread == nullptr || parent_thread->is_invalid()) {
-		/* If we have a valid parent we assign the new child to it otherwise we set ptid = 0. */
-		tinfo->set_ptid(0);
-		tinfo->update_main_fdtable();
+	std::shared_ptr<sinsp_threadinfo> parent;
+	if(tinfo->get_pid() != 1) {
+		parent = find_thread(ptid, true);
+	}
+	if(parent == nullptr || parent->is_invalid()) {
+		tginfo->link_new(nullptr, ptid);
+		publish();
 		return;
 	}
-	parent_thread->add_child(tinfo);
+	if(parent->get_tginfo() != nullptr) {
+		if(!tginfo->link_new(parent->get_tginfo(), parent->m_tid)) {
+			log_refused_parent_link("parent", *tginfo, *parent->get_tginfo(), parent->m_tid);
+		}
+		publish();
+		return;
+	}
+
+	/* The `/proc` scan creates dependencies in table order, so the parent can have no group yet.
+	 * Create that group first. A loop in the ppids can lead back here, so publish this group
+	 * first, with a pending rank. The pending rank makes the link that closes the loop fail.
+	 */
+	tginfo->set_rank_pending();
+	publish();
+	create_thread_dependencies(parent);
+	if(!tginfo->link_new(parent->get_tginfo(), parent->m_tid)) {
+		log_refused_parent_link("parent", *tginfo, *parent->get_tginfo(), parent->m_tid);
+	}
+}
+
+template<typename SyncPolicy>
+void sinsp_thread_manager_impl<SyncPolicy>::relink_group(
+        thread_group_info& tginfo,
+        const std::shared_ptr<sinsp_threadinfo_impl<SyncPolicy>>& parent,
+        const int64_t ptid) {
+	if(parent != nullptr && !parent->is_invalid() && parent->get_tginfo() != nullptr) {
+		if(tginfo.relink(parent->get_tginfo(), parent->m_tid)) {
+			return;
+		}
+		log_refused_parent_link("parent", tginfo, *parent->get_tginfo(), parent->m_tid);
+		tginfo.unlink(ptid);
+		tginfo.set_link_refused();
+		return;
+	}
+	tginfo.unlink(ptid);
+}
+
+template<typename SyncPolicy>
+void sinsp_thread_manager_impl<SyncPolicy>::update_parent_link(
+        sinsp_threadinfo_impl<SyncPolicy>& tinfo) {
+	auto tginfo = tinfo.get_tginfo();
+	if(tginfo == nullptr) {
+		return;
+	}
+	link_past_dead_parents(tinfo);
+	if(!tginfo->awaits_parent()) {
+		return;
+	}
+
+	const int64_t parent_tid = tginfo->get_parent_tid();
+	std::shared_ptr<sinsp_threadinfo> parent = find_thread(parent_tid, true);
+	if(parent == nullptr || parent->is_invalid() || parent->get_tginfo() == nullptr) {
+		return;
+	}
+	relink_group(*tginfo, parent, parent_tid);
+	if(tginfo->get_parent() != nullptr) {
+		libsinsp_logger()->format(sinsp_logger::SEV_DEBUG,
+		                          "Late parent link: pid %" PRId64 " to parent tid %" PRId64
+		                          " (pid %" PRId64 "), after it joined the thread table",
+		                          tginfo->get_tgroup_pid(),
+		                          parent->m_tid,
+		                          parent->get_pid());
+	}
+}
+
+template<typename SyncPolicy>
+void sinsp_thread_manager_impl<SyncPolicy>::link_past_dead_parents(
+        sinsp_threadinfo_impl<SyncPolicy>& tinfo) {
+	auto tginfo = tinfo.get_tginfo();
+	if(tginfo == nullptr) {
+		return;
+	}
+	/* Keep the dead parent alive while we compare against it */
+	const auto seen = tginfo->get_parent();
+	if(seen == nullptr || !seen->is_dead()) {
+		return;
+	}
+	/* The parent that a reader gets */
+	auto parent = tinfo.get_linked_parent();
+	if(parent != nullptr && parent->get_tginfo() != nullptr) {
+		tginfo->skip_dead_parent(seen.get(), parent->get_tginfo(), parent->m_tid);
+	}
 }
 
 /* Can be called when:
@@ -311,18 +419,6 @@ typename threadinfo_map_impl_t<SyncPolicy>::ptr_t sinsp_thread_manager_impl<Sync
 	return m_threadtable.put(tinfo_shared_ptr);
 }
 
-template<typename SyncPolicy>
-void sinsp_thread_manager_impl<SyncPolicy>::remove_child_from_parent(
-        int64_t ptid,
-        const std::shared_ptr<sinsp_threadinfo_impl<SyncPolicy>>& child) {
-	typename threadinfo_map_impl_t<SyncPolicy>::ptr_t parent = find_thread(ptid, true);
-	if(!parent) {
-		return;
-	}
-
-	parent->remove_child_and_maybe_clean(child);
-}
-
 /* Taken from `find_new_reaper` kernel function:
  *
  * When we die, we re-parent all our children, and try to:
@@ -362,8 +458,7 @@ sinsp_thread_manager_impl<SyncPolicy>::find_new_reaper(sinsp_threadinfo_impl<Syn
 	std::unordered_set<int64_t> loop_detection_set{tinfo->m_tid};
 	uint16_t prev_set_size = 1;
 
-	auto parent_ptr = find_thread(tinfo->get_ptid(), true);
-	sinsp_threadinfo_impl<SyncPolicy>* parent_tinfo = parent_ptr.get();
+	auto parent_tinfo = get_parent_thread(*tinfo);
 	while(parent_tinfo != nullptr) {
 		prev_set_size = loop_detection_set.size();
 		loop_detection_set.insert(parent_tinfo->m_tid);
@@ -394,8 +489,7 @@ sinsp_thread_manager_impl<SyncPolicy>::find_new_reaper(sinsp_threadinfo_impl<Syn
 				return result;
 			}
 		}
-		parent_ptr = find_thread(parent_tinfo->get_ptid(), true);
-		parent_tinfo = parent_ptr.get();
+		parent_tinfo = get_parent_thread(*parent_tinfo);
 	}
 
 	return {};
@@ -416,7 +510,7 @@ void sinsp_thread_manager_impl<SyncPolicy>::remove_main_thread_fdtable(
 		return;
 	}
 
-	sinsp_fdtable* fd_table_ptr = main_thread->get_fd_table();
+	auto* fd_table_ptr = main_thread->get_fd_table_mut();
 	if(fd_table_ptr == nullptr) {
 		return;
 	}
@@ -425,15 +519,35 @@ void sinsp_thread_manager_impl<SyncPolicy>::remove_main_thread_fdtable(
 	eparams.m_remove_from_table = false;
 	eparams.m_tinfo = main_thread;
 
-	fd_table_ptr->loop([&](int64_t fd, sinsp_fdinfo& fdinfo) {
+	// Iterate read-only: on_erase_fd only reads the entry unless it has a live
+	// transaction to finalize, in which case it re-fetches a writable
+	// copy-on-write copy itself. This avoids cloning an entire fd table — which
+	// may be shared with other processes' tables via fork inheritance — every
+	// time a process exits, just to notify and then destroy it (historically
+	// the single largest source of cow detaches).
+	//
+	// The fd numbers are snapshotted up front because on_erase_fd's writable
+	// re-fetch may detach the underlying map, which must not happen while the
+	// table is being iterated.
+	std::vector<int64_t> fds;
+	fds.reserve(fd_table_ptr->size());
+	fd_table_ptr->const_loop([&fds](int64_t fd, const auto&) {
+		fds.push_back(fd);
+		return true;
+	});
+
+	for(const int64_t fd : fds) {
+		const auto fdinfo = fd_table_ptr->find(fd);
+		if(fdinfo == nullptr) {
+			continue;
+		}
 		// The canceled fd should always be deleted immediately, so if it appears here it means we
 		// have a problem. Note: it looks like that the canceled FD may appear here in case of high
 		// drop, and we need to recover. This was an assertion failure, now removed.
 		eparams.m_fd = fd;
-		eparams.m_fdinfo = &fdinfo;
+		eparams.m_fdinfo = fdinfo.get();
 		m_observer->on_erase_fd(&eparams);
-		return true;
-	});
+	}
 }
 
 template<typename SyncPolicy>
@@ -453,7 +567,6 @@ void sinsp_thread_manager_impl<SyncPolicy>::remove_thread(int64_t tid) {
 	 * which don't have a group or children.
 	 */
 	if(thread_to_remove->is_invalid() || thread_to_remove->get_tginfo() == nullptr) {
-		remove_child_from_parent(thread_to_remove->get_ptid(), thread_to_remove);
 		m_threadtable.erase(tid);
 		return;
 	}
@@ -467,78 +580,27 @@ void sinsp_thread_manager_impl<SyncPolicy>::remove_thread(int64_t tid) {
 		thread_to_remove->set_dead();
 	}
 
-	/* [Reparent children]
-	 * There are different cases:
-	 * 1. We have no children so we have nothing to reparent.
-	 * 2. We receive a PROC_EXIT event for this thread, with reaper info:
-	 *   - Reaper 0 means that the kernel didn't find any children for this thread,
-	 *     probably we are not correctly aligned with it. In this case, we will use our userspace
-	 * logic to find a reaper.
-	 *   - Reaper -1 means that we cannot find the correct reaper info in the kernel due
-	 *     to BPF verifier limits. In this case, we will use our userspace logic to find a reaper.
-	 *   - Reaper > 0 means the kernel sent us a valid reaper we will use it if present in our
-	 * thread table. If not present we will use our userspace logic.
-	 * 3. We receive an old version of the PROC_EXIT event without reaper info. In this case,
-	 *    we use our userspace logic.
-	 * 4. We lost the PROC_EXIT event, so we are here because the purging logic called us. Also
-	 *    in this case we use our userspace logic.
-	 *
-	 * So excluding the case in which the kernel sent us a valid reaper we always fallback to
-	 * our userspace logic.
+	/* [Hand over its children]
+	 * The children keep their link to this thread. Readers go to the first live thread of the
+	 * group (see `thread_in_group`). The main thread stays in the table while its group lives,
+	 * so it is marked as removed.
 	 */
-	if(thread_to_remove->has_children()) {
-		typename threadinfo_map_impl_t<SyncPolicy>::ptr_t reaper_tinfo;
-
-		if(thread_to_remove->get_reaper_tid() > 0) {
-			/* The kernel sent us a valid reaper
-			 * We should have the reaper thread in the table, but if we don't have
-			 * it, we try to create it from /proc
-			 */
-			reaper_tinfo = get_thread(thread_to_remove->get_reaper_tid());
-		}
-
-		if(!reaper_tinfo || reaper_tinfo->is_invalid()) {
-			/* Fallback case:
-			 * We search for a reaper in best effort traversing our table
-			 */
-			reaper_tinfo = find_new_reaper(thread_to_remove.get());
-		}
-
-		if(reaper_tinfo) {
-			/* We update the reaper tid if necessary. */
-			thread_to_remove->set_reaper_tid(reaper_tinfo->m_tid);
-
-			/* If that thread group was not marked as a reaper we mark it now.
-			 * Since the reaper could be also a thread in the same thread group
-			 * we need to exclude that case. In all other cases, we want to mark
-			 * the thread group as a reaper:
-			 * - init process of a namespace.
-			 * - process that called prctl on itself.
-			 * Please note that in the kernel init processes are not marked with
-			 * `is_child_subreaper` but here we don't make distinctions we mark reapers and sub
-			 * reapers with the same flag.
-			 */
-			if(reaper_tinfo->get_pid() != thread_to_remove->get_pid() &&
-			   reaper_tinfo->get_tginfo()) {
-				reaper_tinfo->get_tginfo()->set_reaper(true);
-			}
-		}
-		thread_to_remove->assign_children_to_reaper(reaper_tinfo.get());
-	}
+	thread_to_remove->set_removed();
 
 	/* [Remove main thread]
-	 * We remove the main thread if there are no other threads in the group
+	 * We remove the main thread if there are no other threads in the group.
+	 * A thread of a group that is already a tombstone was left in the table when the group died,
+	 * without automatic purging. The pid may belong to a new process by now, so the removal of
+	 * the thread removes only the thread itself.
 	 */
-	if((thread_to_remove->get_tginfo()->get_thread_count() == 0)) {
+	if(thread_to_remove->get_tginfo()->get_thread_count() == 0 &&
+	   !thread_to_remove->get_tginfo()->is_dead()) {
 		auto main_thread_holder = thread_to_remove->get_main_thread();
 		remove_main_thread_fdtable(main_thread_holder.get());
 
-		/* we remove the main thread and the thread group */
-		/* even if thread_to_remove is not the main thread the parent will be
-		 * the same so it's ok.
-		 */
+		/* The group stays as a tombstone while children link to it */
+		bury_thread_group(*thread_to_remove);
 		thread_to_remove->get_tginfo()->remove_thread_from_list(thread_to_remove);
-		remove_child_from_parent(thread_to_remove->get_ptid(), thread_to_remove);
 		{
 			std::unique_lock lock(m_thread_groups_mutex);
 			m_thread_groups.erase(thread_to_remove->get_pid());
@@ -556,13 +618,94 @@ void sinsp_thread_manager_impl<SyncPolicy>::remove_thread(int64_t tid) {
 	 */
 	if(!thread_to_remove->is_main_thread()) {
 		thread_to_remove->get_tginfo()->remove_thread_from_list(thread_to_remove);
-		remove_child_from_parent(thread_to_remove->get_ptid(), thread_to_remove);
 		m_threadtable.erase(tid);
 	}
 	if(m_sinsp_stats_v2 != nullptr) {
 		auto& c = m_sinsp_stats_v2->get_thread_counters();
 		c.inc_n_removed_threads();
 	}
+}
+
+/* Return the nearest live subreaper (or init) above the process of `tinfo`, in its pid
+ * namespace, or nullptr. Every step goes down in rank, so the search ends.
+ */
+static std::shared_ptr<sinsp_threadinfo> find_reaper_above(const sinsp_threadinfo& tinfo) {
+	for(auto ancestor = tinfo.get_linked_parent(); ancestor != nullptr;
+	    ancestor = ancestor->get_linked_parent()) {
+		const auto group = ancestor->get_tginfo();
+		if(group == nullptr) {
+			break;
+		}
+		if(ancestor->is_in_pid_namespace() != tinfo.is_in_pid_namespace()) {
+			return nullptr;
+		}
+		if(!group->is_reaper() || group->get_thread_count() == 0) {
+			continue;
+		}
+		/* A thread of the group itself, as in thread_in_group() */
+		auto thread = group->find_thread([&group](const std::shared_ptr<sinsp_threadinfo>& t) {
+			return t->get_tginfo() == group && !t->is_dead();
+		});
+		if(thread != nullptr) {
+			return thread;
+		}
+	}
+	return nullptr;
+}
+
+/* [Record the reaper]
+ * Use the reaper that the kernel sent for the last thread, if it sent one (> 0) and we have it.
+ * Otherwise, search for one, as the kernel does. The value is 0 when the kernel saw no children.
+ * It is -1 when the kernel did not compute a reaper, for an old event, or for a lost exit. The
+ * reaper is picked once, here: a subreaper that is set or cleared later changes nothing.
+ */
+template<typename SyncPolicy>
+void sinsp_thread_manager_impl<SyncPolicy>::bury_thread_group(
+        sinsp_threadinfo_impl<SyncPolicy>& last_thread) {
+	const auto tginfo = last_thread.get_tginfo();
+	std::shared_ptr<sinsp_threadinfo> reaper_tinfo;
+
+	if(last_thread.get_reaper_tid() > 0) {
+		/* We should have the reaper thread in the table, but if we don't have
+		 * it, we try to create it from /proc
+		 */
+		reaper_tinfo = get_thread(last_thread.get_reaper_tid());
+	}
+
+	if(reaper_tinfo != nullptr && !reaper_tinfo->is_invalid() &&
+	   reaper_tinfo->get_tginfo() != nullptr && reaper_tinfo->get_tginfo() != tginfo) {
+		/* The reaper is nearly always an ancestor, so it ranks lower. If not, our tree is wrong,
+		 * for example because of a tid reused after a lost exit, or missing ancestry. Then the
+		 * link is refused, and we search for a reaper.
+		 */
+		if(tginfo->link_reaper(reaper_tinfo->get_tginfo(), reaper_tinfo->m_tid)) {
+			/* If that thread group was not marked as a reaper we mark it now:
+			 * - init process of a namespace.
+			 * - process that called prctl on itself.
+			 * Please note that in the kernel init processes are not marked with
+			 * `is_child_subreaper` but here we don't make distinctions we mark reapers and sub
+			 * reapers with the same flag.
+			 */
+			reaper_tinfo->get_tginfo()->set_reaper(true);
+			tginfo->set_dead();
+			return;
+		}
+		log_refused_parent_link("reaper",
+		                        *tginfo,
+		                        *reaper_tinfo->get_tginfo(),
+		                        reaper_tinfo->m_tid);
+	}
+
+	/* The search goes up the parent links, so its result always ranks lower. If the kernel saw
+	 * no children, nothing needs a reaper, and the exit does not search.
+	 */
+	reaper_tinfo = last_thread.get_reaper_tid() != 0 ? find_reaper_above(last_thread) : nullptr;
+	if(reaper_tinfo == nullptr ||
+	   !tginfo->link_reaper(reaper_tinfo->get_tginfo(), reaper_tinfo->m_tid)) {
+		/* No reaper: the children of the tombstone have no parent */
+		tginfo->unlink(0);
+	}
+	tginfo->set_dead();
 }
 
 template<typename SyncPolicy>
@@ -580,9 +723,20 @@ void sinsp_thread_manager_impl<SyncPolicy>::fix_sockets_coming_from_proc(
 }
 
 template<typename SyncPolicy>
+void sinsp_thread_manager_impl<SyncPolicy>::deduplicate_fd_tables() {
+	typename sinsp_fdtable_impl<SyncPolicy>::dedup_registry registry;
+	m_threadtable.loop([&](sinsp_threadinfo_impl<SyncPolicy>& tinfo) {
+		if(tinfo.is_main_thread()) {
+			tinfo.get_fdtable().deduplicate_into(registry);
+		}
+		return true;
+	});
+}
+
+template<typename SyncPolicy>
 void sinsp_thread_manager_impl<SyncPolicy>::clear_thread_pointers(
         sinsp_threadinfo_impl<SyncPolicy>& tinfo) {
-	sinsp_fdtable* fdt = tinfo.get_fd_table();
+	const auto* fdt = tinfo.get_fd_table();
 	if(fdt != NULL) {
 		fdt->reset_cache();
 	}
@@ -591,7 +745,6 @@ void sinsp_thread_manager_impl<SyncPolicy>::clear_thread_pointers(
 template<typename SyncPolicy>
 void sinsp_thread_manager_impl<SyncPolicy>::reset_child_dependencies() {
 	m_threadtable.loop([&](sinsp_threadinfo_impl<SyncPolicy>& tinfo) {
-		tinfo.clean_expired_children();
 		/* Little optimization: only the main thread cleans the thread group from expired threads.
 		 * Downside: if the main thread is not present in the thread group because we lost it we
 		 * don't clean the thread group from expired threads.
@@ -655,6 +808,18 @@ void sinsp_thread_manager_impl<SyncPolicy>::thread_to_scap(sinsp_threadinfo_impl
 	sctinfo->vpid = tinfo.get_vpid();
 	sctinfo->fdlist = NULL;
 	sctinfo->loginuid = tinfo.get_loginuid();
+	sctinfo->pidns_init_start_ts = tinfo.m_pidns_init_start_ts;
+	sctinfo->tty = tinfo.get_tty();
+	sctinfo->cap_inheritable = tinfo.get_cap_inheritable();
+	sctinfo->cap_permitted = tinfo.get_cap_permitted();
+	sctinfo->cap_effective = tinfo.get_cap_effective();
+	sctinfo->exe_writable = tinfo.get_exe_writable();
+	sctinfo->exe_upper_layer = tinfo.get_exe_upper_layer();
+	sctinfo->exe_lower_layer = tinfo.get_exe_lower_layer();
+	sctinfo->exe_from_memfd = tinfo.get_exe_from_memfd();
+	sctinfo->exe_ino = tinfo.get_exe_ino();
+	sctinfo->exe_ino_ctime = tinfo.get_exe_ino_ctime();
+	sctinfo->exe_ino_mtime = tinfo.get_exe_ino_mtime();
 	sctinfo->filtered_out = tinfo.get_filtered_out();
 }
 
@@ -736,33 +901,16 @@ template<typename SyncPolicy>
 void sinsp_thread_manager_impl<SyncPolicy>::traverse_parent_state(
         sinsp_threadinfo_impl<SyncPolicy>& tinfo,
         visitor_func_t& visitor) {
-	// Floyd's cycle detection: two pointers traverse the parent chain at
-	// different rates. If they meet before reaching the end, there's a loop.
-	// We hold shared_ptr locals so the underlying threadinfo stays alive
+	// Every step goes up a parent link, and the parent links have no cycle (see
+	// `thread_group_info`). We hold shared_ptr locals so the underlying threadinfo stays alive
 	// even if another thread concurrently erases it from the table.
-
-	auto slow = find_thread(tinfo.get_ptid(), true);
-	auto fast = slow;
-
-	fast = (fast ? find_thread(fast->get_ptid(), true) : fast);
-
-	while(slow && slow->m_tid != -1) {
-		if(!visitor(slow.get())) {
-			break;
-		}
-
-		slow = find_thread(slow->get_ptid(), true);
-
-		for(uint32_t i = 0; i < 2; i++) {
-			fast = (fast ? find_thread(fast->get_ptid(), true) : fast);
-
-			if(slow && (slow.get() == fast.get() || slow->m_tid == slow->get_ptid())) {
-				tinfo.report_thread_loop(*slow);
-				return;
-			}
-		}
+	ASSERT(tinfo.get_tginfo() == nullptr || tinfo.get_tginfo()->chain_ends());
+	for(auto parent = get_parent_thread(tinfo);
+	    parent != nullptr && parent->m_tid != -1 && visitor(parent.get());
+	    parent = get_parent_thread(*parent)) {
 	}
 }
+
 template<typename SyncPolicy>
 typename threadinfo_map_impl_t<SyncPolicy>::ptr_t
 sinsp_thread_manager_impl<SyncPolicy>::get_oldest_matching_ancestor(
@@ -901,13 +1049,13 @@ void sinsp_thread_manager_impl<SyncPolicy>::dump_threads_to_file(scap_dumper_t* 
 			//
 			// Add the FDs
 			//
-			sinsp_fdtable* fd_table_ptr = tinfo.get_fd_table();
+			const sinsp_fdtable* fd_table_ptr = tinfo.get_fd_table();
 			if(fd_table_ptr == NULL) {
 				return false;
 			}
 
 			bool should_exit = false;
-			fd_table_ptr->loop([&](int64_t fd, sinsp_fdinfo& info) {
+			fd_table_ptr->const_loop([&](int64_t fd, const sinsp_fdinfo& info) {
 				//
 				// Allocate the scap fd info
 				//
@@ -1027,7 +1175,6 @@ typename threadinfo_map_impl_t<SyncPolicy>::ptr_t sinsp_thread_manager_impl<Sync
 			fake_tinfo->set_pid(-1);
 			fake_tinfo->set_ptid(-1);
 			fake_tinfo->set_reaper_tid(-1);
-			fake_tinfo->set_not_expired_children(0);
 			fake_tinfo->set_comm("<NA>");
 			fake_tinfo->set_exe("<NA>");
 			fake_tinfo->set_uid(0xffffffff);
@@ -1054,7 +1201,6 @@ sinsp_thread_manager_impl<SyncPolicy>::get_or_create_fake_thread(int64_t tid) {
 	fake_tinfo->set_pid(-1);
 	fake_tinfo->set_ptid(-1);
 	fake_tinfo->set_reaper_tid(-1);
-	fake_tinfo->set_not_expired_children(0);
 	fake_tinfo->set_comm("<NA>");
 	fake_tinfo->set_exe("<NA>");
 	fake_tinfo->set_uid(0xffffffff);
@@ -1087,19 +1233,33 @@ sinsp_thread_manager_impl<SyncPolicy>::find_thread(int64_t tid, bool lookup_only
 }
 
 template<typename SyncPolicy>
+typename threadinfo_map_impl_t<SyncPolicy>::ptr_t
+sinsp_thread_manager_impl<SyncPolicy>::get_parent_thread(
+        const sinsp_threadinfo_impl<SyncPolicy>& tinfo) {
+	/* A thread out of the process tree has no parent to follow. */
+	if(tinfo.get_tginfo() == nullptr) {
+		return nullptr;
+	}
+
+	auto parent = tinfo.get_linked_parent();
+	if(parent != nullptr) {
+		/* As find_thread() does */
+		parent->update_main_fdtable();
+	}
+	return parent;
+}
+
+template<typename SyncPolicy>
 typename threadinfo_map_impl_t<SyncPolicy>::ptr_t sinsp_thread_manager_impl<
         SyncPolicy>::get_ancestor_process(sinsp_threadinfo_impl<SyncPolicy>& tinfo, uint32_t n) {
-	auto mt = tinfo.get_main_thread();
+	auto mt = tinfo.get_main_thread_or_self();
 
 	for(uint32_t i = 0; i < n; i++) {
-		if(!mt) {
-			return {};
-		}
-		auto parent = find_thread(mt->get_ptid(), true);
+		auto parent = get_parent_thread(*mt);
 		if(!parent) {
 			return {};
 		}
-		mt = parent->get_main_thread();
+		mt = parent->get_main_thread_or_self();
 	}
 
 	if(mt) {

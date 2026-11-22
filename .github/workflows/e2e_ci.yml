@@ -22,7 +22,7 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout Libs ⤵️
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -65,7 +65,7 @@ jobs:
           sudo apt install -y --no-install-recommends gcc-multilib g++-multilib
 
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Build e2e tests 🏗️
         env:
@@ -85,7 +85,7 @@ jobs:
           sudo rm -vfr build/test/libsinsp_e2e/resources/_proc
 
       - name: Cache build
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: always()
         id: cache
         with:
@@ -103,13 +103,13 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout Libs ⤵️
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Restore build
         id: cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build
           key: build-e2e-${{ matrix.arch }}-${{ github.run_id }}

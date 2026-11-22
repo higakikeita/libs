@@ -38,7 +38,7 @@ jobs:
         architecture: [ X64, ARM64 ]
     runs-on: [ "self-hosted", "linux", "${{matrix.architecture}}", "kernel-testing-matrix" ]
     steps:
-      - uses: falcosecurity/kernel-testing@ba69d924c6f0145ecdddc57705a450ac45e20398
+      - uses: falcosecurity/kernel-testing@54567e3c919781ad3ccd17e42331a93c22251c74
         id: kernel_tests
         with:
           libsversion: ${{ inputs.libsversion }}
@@ -46,12 +46,12 @@ jobs:
           build_matrix: 'true'
           images_tag: 'v0.4.0'
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ansible_output_${{matrix.architecture}}
           path: ${{ steps.kernel_tests.outputs.ansible_output }}
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: matrix_${{matrix.architecture}}
           path: ${{ steps.kernel_tests.outputs.matrix_output }}

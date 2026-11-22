@@ -13,10 +13,10 @@ jobs:
     runs-on: [ "self-hosted", "linux", "X64" ]
     steps:
       - name: Checkout Libs ⤵️
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Checkout Google benchmark ⤵️
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: 'google/benchmark'
           ref: '6a8dee95ae1151142fe4be94482cdfd11b7111bd' # Temporary solution, not released yet.
@@ -27,7 +27,7 @@ jobs:
         uses: ./.github/actions/composite-perf
 
       - name: Download latest master report
-        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151 # v21
+        uses: dawidd6/action-download-artifact@eab87c9830c39eff17e5a6eadb20bfb4bc880477 # v27
         with:
           branch: master
           event: push
@@ -55,13 +55,15 @@ jobs:
           python3 -m venv .venv
           ./.venv/bin/python -m pip install setuptools # Needed because Python 3.12 doesn't ship distutils anymore.
           ./.venv/bin/python -m pip install -r google-benchmark/tools/requirements.txt
-          ./.venv/bin/python google-benchmark/tools/compare.py --no-color benchmarks gbench_data.json "${{ steps.perf.outputs.gbench_json }}" &> gbench_diff.txt
+          ./.venv/bin/python google-benchmark/tools/compare.py --no-color --display_aggregates_only --dump_to_json gbench_diff.json benchmarks gbench_data.json "${{ steps.perf.outputs.gbench_json }}" &> gbench_diff.txt
 
       - name: Archive perf diff
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf_diff
-          path: '*_diff.txt'
+          path: |
+            *_diff.txt
+            gbench_diff.json
           if-no-files-found: error
 
       - name: Save PR info
@@ -90,15 +92,13 @@ jobs:
           tail -n3 "heaptrack_scap_diff.txt" >> ./pr/COMMENT
           echo "\`\`\`" >> ./pr/COMMENT
           echo "# Benchmarks diff from master" >> ./pr/COMMENT
-          echo "\`\`\`" >> ./pr/COMMENT
-          cat "gbench_diff.txt" >> ./pr/COMMENT
-          echo "\`\`\`" >> ./pr/COMMENT
+          python3 .github/gbench-comment.py gbench_diff.json >> ./pr/COMMENT
           echo Uploading PR info...
           cat ./pr/COMMENT
           echo ""
 
       - name: Upload PR info as artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v4
         with:
           name: pr-perf
           path: pr/

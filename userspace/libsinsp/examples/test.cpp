@@ -17,14 +17,16 @@ limitations under the License.
 #include <cstdio>
 #include <cinttypes>
 #include <iostream>
+#include <fstream>
 #include <chrono>
 #include <cxxopts.hpp>
 #include <csignal>
+#include <vector>
 #include <libsinsp/sinsp.h>
 #include <libsinsp/sinsp_buffer.h>
 #include <libscap/scap_engines.h>
+#include <libscap/scap_savefile.h>
 #include <functional>
-#include <memory>
 #include "util.h"
 
 #include <iomanip>
@@ -33,10 +35,9 @@ limitations under the License.
 #include <vector>
 #include <map>
 #include <libsinsp/state/table_registry.h>
-#include <unordered_set>
-#include <memory>
 #include <thread>
 #include <json/json.h>
+#include <zlib.h>
 
 #ifndef _WIN32
 extern "C" {
@@ -83,10 +84,29 @@ static string table_mode = "";
 static string engine_string;
 static string filter_string = "";
 static string file_path = "";
+// Backing storage for the raw_block engine. These must outlive the capture, so
+// the buffer pointer and size are kept here and handed to open_raw_block().
+static std::vector<uint8_t> raw_block_buffer;
+static uint8_t* raw_block_buffer_ptr = nullptr;
+static uint64_t raw_block_buffer_size = 0;
+// How the raw_block engine is fed the capture:
+// - WHOLE_FILE: the entire capture is exposed to the engine at once.
+// - INCREMENTAL_REPLACE (default): fed one chunk at a time; each time next() returns
+//   SCAP_EOF we point the window at the next chunk and rewind the reader with fseek(0),
+//   reusing the buffer rather than growing it.
+// - INCREMENTAL_APPEND: fed one chunk at a time; each time next() returns SCAP_EOF we grow
+//   the visible window to reveal the next chunk. The reader continues from where it left
+//   off, so no rewind is needed.
+// Both incremental modes exercise the ability to keep feeding the inspector after an EOF.
+// raw_block_next_offset is the offset of the next chunk to feed.
+enum class raw_block_feed_mode { WHOLE_FILE, INCREMENTAL_REPLACE, INCREMENTAL_APPEND };
+static raw_block_feed_mode raw_block_mode = raw_block_feed_mode::INCREMENTAL_REPLACE;
+static uint64_t raw_block_next_offset = 0;
 static unsigned long buffer_bytes_dim = DEFAULT_DRIVER_BUFFER_BYTES_DIM;
 static double buffers_num = DEFAULT_BUFFERS_NUM;
 static double iters_num = DEFAULT_ITERS_NUM;
 static bool all_cpus = false;
+static bool disable_iterators = false;
 static uint64_t max_events = UINT64_MAX;
 static std::shared_ptr<sinsp_plugin> plugin;
 static std::string open_params;  // for source plugins, its open params
@@ -457,6 +477,16 @@ void parse_CLI_options(sinsp& inspector, int argc, char** argv) {
 		("s,scap_file",
 			"Scap file",
 			cxxopts::value<std::string>())
+		("R,raw_block",
+			"Raw block engine. Reads the scap file specified by the \"-s\" option "
+			"fully into memory and replays its blocks through the raw_block engine.")
+		("raw_block_mode",
+			"(raw_block engine only) How to feed the capture to the engine: \"whole_file\" "
+			"exposes the whole capture at once; \"incremental_replace\" (default) feeds one "
+			"chunk at a time, replacing the buffer and rewinding the reader after each "
+			"SCAP_EOF; \"incremental_append\" feeds one chunk at a time, growing the buffer "
+			"after each SCAP_EOF.",
+			cxxopts::value<std::string>())
 		("p,plugin",
 			"Plugin. Path can follow the pattern \"filepath.so|init_cfg|open_params\". "
 			"Must come after the \"-s\" option when reading events from a file.",
@@ -467,6 +497,8 @@ void parse_CLI_options(sinsp& inspector, int argc, char** argv) {
 		("A,all-cpus",
 			"(modern eBPF probe only) Allocate ring buffers for all available CPUs "
 			"(default: allocate ring buffers for online CPU(s) only).")
+	("i,disable-iterators",
+		"(modern eBPF probe only) Disable BPF iterator support (default: enable support).")
 		("o,output-fields",
 			"Output fields string (see <filter> for supported display fields) that "
 			"overwrites default output fields for all events. * at the beginning "
@@ -549,8 +581,28 @@ void parse_CLI_options(sinsp& inspector, int argc, char** argv) {
 		}
 
 		if(result.count("scap_file")) {
-			select_engine(SAVEFILE_ENGINE);
 			file_path = result["scap_file"].as<std::string>();
+			// -R reads the same scap file through the raw_block engine instead of savefile.
+			select_engine(result.count("raw_block") ? RAW_BLOCK_ENGINE : SAVEFILE_ENGINE);
+		} else if(result.count("raw_block")) {
+			std::cerr << "The --raw_block option requires a scap file (-s)." << std::endl;
+			exit(EXIT_FAILURE);
+		}
+
+		if(result.count("raw_block_mode")) {
+			const auto mode = result["raw_block_mode"].as<std::string>();
+			if(mode == "whole_file") {
+				raw_block_mode = raw_block_feed_mode::WHOLE_FILE;
+			} else if(mode == "incremental_replace") {
+				raw_block_mode = raw_block_feed_mode::INCREMENTAL_REPLACE;
+			} else if(mode == "incremental_append") {
+				raw_block_mode = raw_block_feed_mode::INCREMENTAL_APPEND;
+			} else {
+				std::cerr << "Invalid raw_block_mode: " << mode
+				          << ". Use 'whole_file', 'incremental_replace', or 'incremental_append'."
+				          << std::endl;
+				exit(EXIT_FAILURE);
+			}
 		}
 
 		if(result.count("plugin")) {
@@ -640,6 +692,10 @@ void parse_CLI_options(sinsp& inspector, int argc, char** argv) {
 			all_cpus = true;
 		}
 
+		if(result.count("disable-iterators")) {
+			disable_iterators = true;
+		}
+
 		if(result.count("output-fields")) {
 			auto output_fields = result["output-fields"].as<std::string>();
 			default_output = output_fields;
@@ -706,6 +762,152 @@ libsinsp::events::set<ppm_sc_code> extract_filter_sc_codes(sinsp& inspector) {
 	return {};
 }
 
+// Load a scap file fully into `raw_block_buffer` so it can be replayed through the
+// raw_block engine. The engine consumes raw (uncompressed) scap blocks, so gzip-compressed
+// scap files are transparently inflated here.
+static void load_raw_block_file(const std::string& path) {
+	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	if(!file) {
+		std::cerr << "Unable to open file: " << path << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	const std::streamsize size = file.tellg();
+	if(size < 0) {
+		std::cerr << "Unable to determine file size: " << path << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	file.seekg(0, std::ios::beg);
+	std::vector<uint8_t> file_data(static_cast<size_t>(size));
+	if(size > 0 && !file.read(reinterpret_cast<char*>(file_data.data()), size)) {
+		std::cerr << "Unable to read file: " << path << std::endl;
+		exit(EXIT_FAILURE);
+	}
+
+	// The gzip magic number is 0x1f8b.
+	const bool is_gzip = file_data.size() >= 2 && file_data[0] == 0x1f && file_data[1] == 0x8b;
+	if(!is_gzip) {
+		raw_block_buffer = std::move(file_data);
+		return;
+	}
+
+	z_stream strm{};
+	// 16 + MAX_WBITS selects gzip decoding.
+	if(inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) {
+		std::cerr << "Unable to initialize zlib for: " << path << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	strm.next_in = file_data.data();
+	strm.avail_in = static_cast<uInt>(file_data.size());
+
+	raw_block_buffer.clear();
+	std::vector<uint8_t> chunk(1 << 16);
+	int ret = Z_OK;
+	do {
+		strm.next_out = chunk.data();
+		strm.avail_out = static_cast<uInt>(chunk.size());
+		ret = inflate(&strm, Z_NO_FLUSH);
+		if(ret != Z_OK && ret != Z_STREAM_END) {
+			inflateEnd(&strm);
+			std::cerr << "Unable to decompress file: " << path << std::endl;
+			exit(EXIT_FAILURE);
+		}
+		raw_block_buffer.insert(raw_block_buffer.end(),
+		                        chunk.data(),
+		                        chunk.data() + (chunk.size() - strm.avail_out));
+	} while(ret != Z_STREAM_END);
+	inflateEnd(&strm);
+}
+
+static bool is_event_block_type(uint32_t block_type) {
+	switch(block_type) {
+	case EV_BLOCK_TYPE:
+	case EV_BLOCK_TYPE_INT:
+	case EV_BLOCK_TYPE_V2:
+	case EV_BLOCK_TYPE_V2_LARGE:
+	case EVF_BLOCK_TYPE:
+	case EVF_BLOCK_TYPE_V2:
+	case EVF_BLOCK_TYPE_V2_LARGE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// Walk the pcapng block sequence and return the offset of the first event block, i.e. the
+// end of the section header + metadata blocks. This is where we split the file so the
+// raw_block engine can be opened with the header blocks and fed the events separately.
+static size_t find_first_event_block_offset(const std::vector<uint8_t>& data) {
+	size_t offset = 0;
+	while(offset + sizeof(block_header) <= data.size()) {
+		block_header bh;
+		memcpy(&bh, data.data() + offset, sizeof(bh));
+		if(is_event_block_type(bh.block_type)) {
+			return offset;
+		}
+		if(bh.block_total_length < sizeof(block_header) + sizeof(uint32_t)) {
+			std::cerr << "Corrupt block with length " << bh.block_total_length << " at offset "
+			          << offset << std::endl;
+			exit(EXIT_FAILURE);
+		}
+		offset += bh.block_total_length;
+	}
+	// No event block found; the whole file is header/metadata.
+	return data.size();
+}
+
+// Feed the next chunk of blocks to the raw_block engine, in either incremental mode. The
+// whole file already lives in raw_block_buffer; a chunk is exposed by pointing the (ptr,
+// size) window at it:
+// - INCREMENTAL_REPLACE: point the window at the chunk and rewind the reader with fseek(0),
+//   so from the engine's point of view the buffer is replaced with a fresh block sequence.
+// - INCREMENTAL_APPEND: grow the window to include the chunk, leaving the reader offset
+//   where it was so it continues into the newly revealed bytes.
+//
+// Event blocks are fed one at a time (to exercise feeding after each SCAP_EOF). A run of
+// non-event blocks is fed as a single chunk: in a concatenated scap file the next capture's
+// section header + metadata blocks must reach the engine's read_init together, since it
+// parses the section header and all following metadata in one pass. Returns false once the
+// whole file has been fed.
+static bool raw_block_feed_next_chunk(sinsp& inspector) {
+	const size_t start = raw_block_next_offset;
+	if(start + sizeof(block_header) > raw_block_buffer.size()) {
+		return false;
+	}
+
+	block_header bh;
+	memcpy(&bh, raw_block_buffer.data() + start, sizeof(bh));
+	size_t offset = start;
+	if(is_event_block_type(bh.block_type)) {
+		offset += bh.block_total_length;
+	} else {
+		// Feed the whole run of header/metadata blocks up to the next event block.
+		while(offset + sizeof(block_header) <= raw_block_buffer.size()) {
+			memcpy(&bh, raw_block_buffer.data() + offset, sizeof(bh));
+			if(is_event_block_type(bh.block_type)) {
+				break;
+			}
+			offset += bh.block_total_length;
+		}
+	}
+	if(offset > raw_block_buffer.size()) {
+		// Truncated trailing block; feed whatever is left and let the engine report it.
+		offset = raw_block_buffer.size();
+	}
+
+	if(raw_block_mode == raw_block_feed_mode::INCREMENTAL_APPEND) {
+		// Grow the window to reveal the chunk; the reader continues where it left off.
+		raw_block_buffer_ptr = raw_block_buffer.data();
+		raw_block_buffer_size = static_cast<uint64_t>(offset);
+	} else {
+		// Replace the window with the chunk and rewind the reader to its start.
+		raw_block_buffer_ptr = raw_block_buffer.data() + start;
+		raw_block_buffer_size = static_cast<uint64_t>(offset - start);
+		inspector.fseek(0);
+	}
+	raw_block_next_offset = offset;
+	return true;
+}
+
 void open_engine(sinsp& inspector, libsinsp::events::set<ppm_sc_code> events_sc_codes) {
 	std::cout << "-- Try to open: '" + engine_string + "' engine." << std::endl;
 	libsinsp::events::set<ppm_sc_code>
@@ -720,8 +922,7 @@ void open_engine(sinsp& inspector, libsinsp::events::set<ppm_sc_code> events_sc_
 		ppm_sc = libsinsp::events::sinsp_repair_state_sc_set(events_sc_codes);
 		if(!ppm_sc.empty()) {
 			auto events_sc_names = libsinsp::events::sc_set_to_sc_names(ppm_sc);
-			printf("-- Activated (%" PRIu64
-			       ") ppm sc names in kernel using `sinsp_repair_state_sc_set` "
+			printf("-- Activated (%zu) ppm sc names in kernel using `sinsp_repair_state_sc_set` "
 			       "enforcement: %s\n",
 			       events_sc_names.size(),
 			       concat_set_in_order(events_sc_names).c_str());
@@ -738,8 +939,7 @@ void open_engine(sinsp& inspector, libsinsp::events::set<ppm_sc_code> events_sc_
 		ppm_sc = ppm_sc.merge(events_sc_codes);
 		if(!ppm_sc.empty()) {
 			auto events_sc_names = libsinsp::events::sc_set_to_sc_names(ppm_sc);
-			printf("-- Activated (%" PRIu64
-			       ") ppm sc names in kernel using `sinsp_state_sc_set` "
+			printf("-- Activated (%zu) ppm sc names in kernel using `sinsp_state_sc_set` "
 			       "enforcement: %s\n",
 			       events_sc_names.size(),
 			       concat_set_in_order(events_sc_names).c_str());
@@ -765,7 +965,39 @@ void open_engine(sinsp& inspector, libsinsp::events::set<ppm_sc_code> events_sc_
 #endif
 #ifdef HAS_ENGINE_MODERN_BPF
 	else if(!engine_string.compare(MODERN_BPF_ENGINE)) {
-		inspector.open_modern_bpf(buffer_bytes_dim, buffers_num, iters_num, !all_cpus, ppm_sc);
+		inspector.open_modern_bpf(buffer_bytes_dim,
+		                          buffers_num,
+		                          iters_num,
+		                          !all_cpus,
+		                          ppm_sc,
+		                          disable_iterators);
+	}
+#endif
+#ifdef HAS_ENGINE_RAW_BLOCK
+	else if(!engine_string.compare(RAW_BLOCK_ENGINE)) {
+		if(file_path.empty()) {
+			std::cerr << "You must specify the path to the file if you use the 'raw_block' engine"
+			          << std::endl;
+			exit(EXIT_FAILURE);
+		}
+		load_raw_block_file(file_path);
+		raw_block_buffer_ptr = raw_block_buffer.data();
+
+		if(raw_block_mode == raw_block_feed_mode::WHOLE_FILE) {
+			// Whole-file mode: the entire capture is visible at once, like the savefile engine.
+			raw_block_buffer_size = static_cast<uint64_t>(raw_block_buffer.size());
+			inspector.open_raw_block(&raw_block_buffer_ptr, &raw_block_buffer_size);
+		} else {
+			// Incremental modes: open the engine with only the section header + metadata blocks
+			// in the buffer. The event blocks are then fed one at a time from the capture loop,
+			// which keeps feeding the inspector after each SCAP_EOF (see
+			// raw_block_feed_next_chunk).
+			const size_t events_offset = find_first_event_block_offset(raw_block_buffer);
+			raw_block_buffer_size = static_cast<uint64_t>(events_offset);
+			inspector.open_raw_block(&raw_block_buffer_ptr, &raw_block_buffer_size);
+			// Feeding continues with the blocks right after the metadata.
+			raw_block_next_offset = static_cast<uint64_t>(events_offset);
+		}
 	}
 #endif
 #ifdef HAS_ENGINE_SOURCE_PLUGIN
@@ -1052,7 +1284,7 @@ int main(int argc, char** argv) {
 	auto events_sc_codes = extract_filter_sc_codes(inspector);
 	if(!events_sc_codes.empty()) {
 		auto events_sc_names = libsinsp::events::sc_set_to_sc_names(events_sc_codes);
-		printf("-- Filter AST (%" PRIu64 ") ppm sc names: %s\n",
+		printf("-- Filter AST (%zu) ppm sc names: %s\n",
 		       events_sc_codes.size(),
 		       concat_set_in_order(events_sc_names).c_str());
 	}
@@ -1167,6 +1399,14 @@ sinsp_evt* get_event(sinsp& inspector,
 		return ev;
 	}
 	if(res == SCAP_EOF) {
+		// In a raw_block incremental mode (the default is incremental_replace), SCAP_EOF means
+		// the current buffer has been consumed. Feed the next chunk and keep going; only stop
+		// once the whole file has been fed. This verifies we can keep feeding after a SCAP_EOF.
+		if(raw_block_mode != raw_block_feed_mode::WHOLE_FILE &&
+		   inspector.check_current_engine(RAW_BLOCK_ENGINE) &&
+		   raw_block_feed_next_chunk(inspector)) {
+			return nullptr;
+		}
 		std::cout << "-- EOF" << std::endl;
 		g_interrupted.store(true);
 		return nullptr;

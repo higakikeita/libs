@@ -46,64 +46,138 @@ limitations under the License.
 // sinsp_filter_expression implementation
 ///////////////////////////////////////////////////////////////////////////////
 void sinsp_filter_expression::add_check(std::unique_ptr<sinsp_filter_check> chk) {
+	assert_not_on_cached_path();
 	m_checks.push_back(std::move(chk));
+	m_children_resolved = false;
+}
+
+std::unique_ptr<sinsp_filter_check> sinsp_filter_expression::release_only_child() {
+	ASSERT(is_pass_through());
+	assert_not_on_cached_path();
+
+	auto child = std::move(m_checks[0]);
+	m_checks.clear();
+	m_child_ops.clear();
+	m_children_resolved = false;
+
+	// The child stands where this expression stood, so it says what this expression said about
+	// how its parent combines it: the operator is this expression's, and the two nots -- this
+	// one's and the child's -- collapse into one, because negating twice is not negating. A
+	// first child's own operator bits are never consulted, so nothing else carries over.
+	child->m_boolop = (boolop)(((uint32_t)m_boolop & ~(uint32_t)BO_NOT) |
+	                           (((uint32_t)m_boolop ^ (uint32_t)child->m_boolop) & BO_NOT));
+
+	// If the child is an expression, its parent is about to be freed.
+	if(auto* child_expr = dynamic_cast<sinsp_filter_expression*>(child.get());
+	   child_expr != nullptr) {
+		child_expr->m_parent = m_parent;
+	}
+
+	return child;
+}
+
+void sinsp_filter_expression::replace_last_check(std::unique_ptr<sinsp_filter_check> chk) {
+	ASSERT(!m_checks.empty());
+	assert_not_on_cached_path();
+	m_checks.back() = std::move(chk);
+	m_children_resolved = false;
+}
+
+void sinsp_filter_expression::splice_first_child_group() {
+	assert_not_on_cached_path();
+	while(m_checks.size() >= 2) {
+		// What this expression does with its children, which is what the group would have to be
+		// doing with its own for the two to be one and the same.
+		const auto chain = get_expr_boolop();
+		if(chain != BO_AND && chain != BO_OR) {
+			return;
+		}
+
+		auto* group = dynamic_cast<sinsp_filter_expression*>(m_checks[0].get());
+		if(group == nullptr || group->get_expr_boolop() != chain) {
+			return;
+		}
+
+		// A group of one is a pass-through and is folded elsewhere; a negated one means
+		// something else entirely, since the not applies to the group and not to its first
+		// child. Its own boolop must say nothing, which a first child's does.
+		if(group->m_checks.size() < 2 || group->m_boolop != BO_NONE) {
+			return;
+		}
+
+		// The group's children arrive with the operators they had: its first carries none,
+		// which is what a first child needs, and the rest carry the operator this expression
+		// uses anyway. So they can simply be laid out in front of the rest.
+		std::vector<std::unique_ptr<sinsp_filter_check>> spliced;
+		spliced.reserve(group->m_checks.size() + m_checks.size() - 1);
+		for(auto& chk : group->m_checks) {
+			if(auto* expr = dynamic_cast<sinsp_filter_expression*>(chk.get()); expr != nullptr) {
+				expr->m_parent = this;
+			}
+			spliced.push_back(std::move(chk));
+		}
+		group->m_checks.clear();
+
+		for(size_t j = 1; j < m_checks.size(); j++) {
+			spliced.push_back(std::move(m_checks[j]));
+		}
+
+		// This frees the group, so nothing may touch it afterwards.
+		m_checks = std::move(spliced);
+		m_child_ops.clear();
+		m_children_resolved = false;
+	}
+}
+
+void sinsp_filter_expression::resolve_children() {
+	m_child_ops.clear();
+	m_child_ops.reserve(m_checks.size());
+	for(const auto& chk : m_checks) {
+		ASSERT(chk != NULL);
+
+		// Bit 0 of a boolop is its not, and what is left is the operator that not applies to.
+		static_assert(BO_NOT == 1 && BO_ORNOT == (BO_OR | BO_NOT) && BO_ANDNOT == (BO_AND | BO_NOT),
+		              "a boolop is an operator with its not in bit 0");
+		const bool negate = (chk->m_boolop & BO_NOT) != 0;
+		const auto op = (boolop)(chk->m_boolop & ~(uint32_t)BO_NOT);
+		ASSERT(op == BO_NONE || op == BO_OR || op == BO_AND);
+
+		// An or is settled by the first child that is true, an and by the first that is
+		// false. The first child has nothing to its left, so its value is never consulted.
+		m_child_ops.push_back({chk.get(), negate, op == BO_OR});
+	}
+	m_children_resolved = true;
 }
 
 bool sinsp_filter_expression::compare(sinsp_evt* evt) {
-	bool res = true;
-
-	sinsp_filter_check* chk = nullptr;
-
-	auto size = m_checks.size();
-	for(size_t j = 0; j < size; j++) {
-		chk = m_checks[j].get();
-		ASSERT(chk != NULL);
-
-		if(j == 0) {
-			switch(chk->m_boolop) {
-			case BO_NONE:
-				res = chk->compare(evt);
-				break;
-			case BO_NOT:
-				res = !chk->compare(evt);
-				break;
-			default:
-				ASSERT(false);
-				break;
-			}
-		} else {
-			switch(chk->m_boolop) {
-			case BO_OR:
-				if(res) {
-					goto done;
-				}
-				res = chk->compare(evt);
-				break;
-			case BO_AND:
-				if(!res) {
-					goto done;
-				}
-				res = chk->compare(evt);
-				break;
-			case BO_ORNOT:
-				if(res) {
-					goto done;
-				}
-				res = !chk->compare(evt);
-				break;
-			case BO_ANDNOT:
-				if(!res) {
-					goto done;
-				}
-				res = !chk->compare(evt);
-				break;
-			default:
-				ASSERT(false);
-				break;
-			}
-		}
+	// The children are resolved on the first event, and again if one has been added since --
+	// which is the only change a filter tree sees once it has been compiled. Nothing outside
+	// this class can change the list without saying so, so this flag is the whole story.
+	if(!m_children_resolved) {
+		resolve_children();
 	}
-done:
+
+	// Read out of the vector once and walked by pointer: every child is an opaque call as far
+	// as the compiler is concerned, so a walk that indexes the vector has to load its bounds
+	// again after each one.
+	const child_op* op = m_child_ops.data();
+	const child_op* const end = op + m_child_ops.size();
+	if(op == end) {
+		return true;
+	}
+
+	// The first child is peeled out of the loop, so that what remains can take for granted
+	// that there is a running value to combine with -- rather than asking, once per child,
+	// whether this is the child that starts one.
+	bool res = op->m_check->compare(evt) != op->m_negate;
+
+	while(++op != end) {
+		if(res == op->m_stop_on) {
+			break;
+		}
+		res = op->m_check->compare(evt) != op->m_negate;
+	}
+
 	return res;
 }
 
@@ -153,14 +227,76 @@ void sinsp_filter::pop_expression() {
 		        "expression mixes 'and' and 'or' in an ambiguous way. Please use brackets.");
 	}
 
-	m_curexpr = m_curexpr->m_parent;
+	invalidate_entry();
+	auto* expr = m_curexpr;
+	m_curexpr = expr->m_parent;
+
+	// The expression is finished, so its children are final. If it has just the one, it does
+	// nothing but run that child and hand the answer up, and its parent can hold the child
+	// itself: a bracket that turned out to hold a single thing, or a not, stops costing a level
+	// of the walk. This frees the expression, so nothing may touch it afterwards.
+	if(expr->is_pass_through()) {
+		ASSERT(m_curexpr->get_checks().back().get() == expr);
+		m_curexpr->replace_last_check(expr->release_only_child());
+	} else {
+		// Otherwise it may be holding a bracketed group that says what it says: one level of
+		// and inside another is one and.
+		expr->splice_first_child_group();
+	}
+}
+
+// Before the tree changes, not after: the change itself asserts it is not restructuring a
+// path the filter cached through.
+void sinsp_filter::invalidate_entry() {
+	if(m_entry == nullptr) {
+		return;
+	}
+	for(auto* expr = dynamic_cast<sinsp_filter_expression*>(m_filter.get());
+	    expr != nullptr && expr->m_on_cached_path;
+	    expr = expr->is_pass_through()
+	                   ? dynamic_cast<sinsp_filter_expression*>(expr->get_checks()[0].get())
+	                   : nullptr) {
+		expr->m_on_cached_path = false;
+	}
+	m_entry = nullptr;
+}
+
+// Runs once per filter, and keeping it out of run()'s frame is the point of the whole change:
+// inlined here, its casts and its loop cost run() six register saves on every event, which is
+// most of the level it removes.
+#if defined(__GNUC__)
+[[gnu::noinline]]
+#endif
+void sinsp_filter::resolve_entry() {
+	sinsp_filter_check* entry = m_filter.get();
+	bool negate = false;
+
+	// A pass-through expression runs one child and forwards its answer, so evaluation can start
+	// at that child and leave the level out. The root is one of those: it holds nothing but the
+	// expression the whole filter turned out to be. A negation on the way down comes along --
+	// and two of them cancel, as they do in the tree itself.
+	for(auto* expr = dynamic_cast<sinsp_filter_expression*>(entry);
+	    expr != nullptr && expr->is_pass_through();
+	    expr = dynamic_cast<sinsp_filter_expression*>(entry)) {
+		expr->m_on_cached_path = true;
+		entry = expr->get_checks()[0].get();
+		negate = negate != ((entry->m_boolop & BO_NOT) != 0);
+	}
+
+	m_entry = entry;
+	m_entry_negate = negate;
 }
 
 bool sinsp_filter::run(sinsp_evt* evt) {
-	return m_filter->compare(evt);
+	if(m_entry == nullptr) {
+		resolve_entry();
+	}
+
+	return m_entry->compare(evt) != m_entry_negate;
 }
 
 void sinsp_filter::add_check(std::unique_ptr<sinsp_filter_check> chk) {
+	invalidate_entry();
 	m_curexpr->add_check(std::move(chk));
 }
 
@@ -840,6 +976,7 @@ sinsp_filter_factory::check_infos_to_fieldclass_infos(
 		cinfo.name = fci->m_name;
 		cinfo.desc = fci->m_desc;
 		cinfo.shortdesc = fci->m_shortdesc;
+		cinfo.is_generic = static_cast<bool>(fci->m_flags & filter_check_info::FL_GENERIC);
 
 		for(auto fld = fci->m_fields; fld != fci->m_fields + fci->m_nfields; ++fld) {
 			// If a field is only used to organize events,

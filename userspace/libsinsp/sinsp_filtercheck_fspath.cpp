@@ -275,9 +275,7 @@ static inline std::string format_dirfd(sinsp_evt* evt) {
 	return fd_name + '/';
 }
 
-uint8_t* sinsp_filter_check_fspath::extract_single(sinsp_evt* evt,
-                                                   uint32_t* len,
-                                                   bool sanitize_strings) {
+uint8_t* sinsp_filter_check_fspath::extract_single(sinsp_evt* evt, uint32_t* len) {
 	*len = 0;
 	ASSERT(evt);
 
@@ -341,8 +339,9 @@ uint8_t* sinsp_filter_check_fspath::extract_single(sinsp_evt* evt,
 				}
 				break;
 			}
-			// For the following syscalls, the event fdinfo is set to their dirfd.
-			// Set `sdir` to the dirfd info path.
+			// For the following syscalls the event fdinfo is set to their dirfd:
+			// their fd parameter *is* the dirfd (see get_exit_event_fd_location()),
+			// so sinsp_parser::reset() installs it. Set `sdir` to that dirfd's path.
 			case PPME_SYSCALL_NEWFSTATAT_X:
 			case PPME_SYSCALL_FCHOWNAT_X:
 			case PPME_SYSCALL_FCHMODAT_X:
@@ -360,16 +359,21 @@ uint8_t* sinsp_filter_check_fspath::extract_single(sinsp_evt* evt,
 				}
 				break;
 			}
-			case PPME_SYSCALL_RENAMEAT2_X: {
-				// newdirfd or olddirfd, we need to extract the dirfd on the fly here
+			case PPME_SYSCALL_RENAMEAT_X:
+			case PPME_SYSCALL_RENAMEAT2_X:
+			case PPME_SYSCALL_LINKAT_2_X: {
+				// Resolve the dirfd associated with the path selected for source/target.
+				const bool is_linkat = evt->get_type() == PPME_SYSCALL_LINKAT_2_X;
 				int64_t dirfd;
 				if(m_field_id == TYPE_TARGET) {
-					// newdirfd
-					dirfd = evt->get_param(3)->as<int64_t>();
+					// renameat uses newdirfd for target; linkat's target is oldpath.
+					const uint32_t param = is_linkat ? 1 : 3;
+					dirfd = evt->get_param(param)->as<int64_t>();
 					sdir = sinsp_parser::parse_dirfd(*evt, m_tstr, dirfd);
 				} else if(m_field_id == TYPE_SOURCE) {
-					// olddirfd
-					dirfd = evt->get_param(1)->as<int64_t>();
+					// renameat uses olddirfd for source; linkat's source is newpath.
+					const uint32_t param = is_linkat ? 3 : 1;
+					dirfd = evt->get_param(param)->as<int64_t>();
 					sdir = sinsp_parser::parse_dirfd(*evt, m_tstr, dirfd);
 				} else {
 					sdir = "<UNKNOWN>";
@@ -405,7 +409,7 @@ uint8_t* sinsp_filter_check_fspath::extract_single(sinsp_evt* evt,
 		}
 	}
 
-	return extract_single_string(m_tstr, len, sanitize_strings);
+	return extract_single_string(m_tstr, len);
 }
 
 bool sinsp_filter_check_fspath::extract_fspath(sinsp_evt* evt,
@@ -418,7 +422,7 @@ bool sinsp_filter_check_fspath::extract_fspath(sinsp_evt* evt,
 		return false;
 	}
 
-	if(!it->second->extract(extract_evt, values, true) || values.size() != 1) {
+	if(!it->second->extract(extract_evt, values) || values.size() != 1) {
 		return false;
 	}
 

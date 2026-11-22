@@ -1,0 +1,99 @@
+# Proof-of-concept: VM-backed kernel compatibility matrix for the modern_bpf
+# probe using bpfcompat (https://github.com/Kernel-Guard/bpfcompat).
+#
+# Validates through the real loader path, as preferred by reviewers: builds
+# scap-open (statically linked, modern_bpf probe skeleton embedded) from this
+# tree, ships it into disposable QEMU/KVM VMs running unmodified vendor
+# distro cloud images, and runs it there with the modern_bpf engine.
+# scap-open's exit code is the per-kernel verdict: scap_open() exercises
+# libpman's full load path (runtime-sized maps, helper-gated program
+# variants, trial-probed iterators, attach), then captures a bounded number
+# of events. There is no manifest to keep in sync with the loader — the
+# loader is the contract. The job summary shows the per-kernel pass/fail
+# matrix; exit code 2 (a required kernel regressed) fails the job.
+#
+# Scope note: this complements drivers_ci/bpfvalidator — it proves the probe
+# loads, attaches, and captures per kernel via the real userspace loader,
+# not full event-content testing.
+name: bpfcompat-compatibility
+
+# Non-blocking by design: scheduled + manually dispatched, never a merge
+# gate. Proposed in https://github.com/falcosecurity/libs/issues/3023.
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 06:00 UTC
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  modern-bpf-matrix:
+    name: modern_bpf kernel compatibility matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build and VM dependencies
+        run: |
+          sudo apt-get update
+          # Since bpfcompat v0.3.1 a commit-SHA pin that matches a release tag
+          # resolves to prebuilt, checksum-verified release binaries, so the
+          # libbpf/zlib headers previously needed to build its in-guest
+          # validator from source are no longer required. The remaining
+          # packages build scap-open (bundled deps) and run the QEMU guests.
+          # cloud-image-utils provides cloud-localds: RHEL-family guests only
+          # boot from a genuine cidata seed ISO, not the vvfat fallback.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang llvm pkg-config autoconf automake \
+            libtool libelf-dev qemu-system-x86 \
+            qemu-utils cloud-image-utils jq
+          # Static bpftool release (needed for skeleton generation): Ubuntu's
+          # linux-tools wrapper can't match the runner's Azure kernel.
+          curl -fsSL -o /tmp/bpftool.tar.gz \
+            https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz
+          tar -xzf /tmp/bpftool.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/bpftool /usr/local/bin/bpftool
+          bpftool version
+
+      - name: Enable KVM on the hosted runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - name: Build scap-open (static, modern_bpf embedded)
+        run: |
+          mkdir -p build && cd build
+          # MUSL_OPTIMIZED_BUILD adds -static: the same binary must run
+          # unchanged on every guest in the matrix (RHEL-family glibc is
+          # older than the runner's), so it is fully statically linked.
+          cmake -DUSE_BUNDLED_DEPS=ON -DBUILD_LIBSCAP_MODERN_BPF=ON \
+            -DMUSL_OPTIMIZED_BUILD=ON \
+            -DMODERN_BPFTOOL_EXE=/usr/local/bin/bpftool \
+            -DCREATE_TEST_TARGETS=OFF -DBUILD_BPF=OFF -DBUILD_DRIVER=OFF ..
+          make scap-open -j"$(nproc)"
+          file libscap/examples/01-open/scap-open
+
+      - name: Validate scap-open across the kernel matrix
+        uses: Kernel-Guard/bpfcompat@179ff612ed2b5d1afb16dd9c282752028d47c415 # v0.3.7
+        with:
+          command: $BPFCOMPAT_BIN --modern_bpf --num_events 10
+          command-binary: build/libscap/examples/01-open/scap-open
+          matrix: test/bpfcompat/kernel-matrix.yaml
+          out: reports/modern-bpf-compat.json
+          markdown: reports/modern-bpf-compat.md
+          timeout: 10m
+          concurrency: "2"
+
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: modern-bpf-compatibility-report
+          path: reports/
+          if-no-files-found: warn

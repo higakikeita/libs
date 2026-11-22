@@ -60,6 +60,33 @@ public:
 	void add_check(std::unique_ptr<sinsp_filter_check> chk);
 
 	//
+	// An expression with a single child computes nothing: it runs that child and forwards the
+	// answer. Such an expression can be replaced by its child, so that no event pays for the
+	// level -- see release_only_child() and sinsp_filter::pop_expression().
+	//
+	bool is_pass_through() const { return m_checks.size() == 1; }
+
+	//
+	// Hand over the only child of a pass-through expression, with its boolop rewritten to say
+	// what this expression's said, so that it can take this expression's place in its parent.
+	//
+	std::unique_ptr<sinsp_filter_check> release_only_child();
+
+	//
+	// Put a check in the place of the one added last, which is how a pass-through child is
+	// replaced by what it was forwarding.
+	//
+	void replace_last_check(std::unique_ptr<sinsp_filter_check> chk);
+
+	//
+	// Take over the children of a first child that combines them the way this expression
+	// combines its own: "(a and b) and c" is "a and b and c", one level instead of two. The
+	// compiler flattens same-operator nesting everywhere else, but not here -- the first child
+	// of a chain is compiled before the operator that joins it to its siblings is known.
+	//
+	void splice_first_child_group();
+
+	//
 	// An expression is consistent if all its checks are of the same type (or/and).
 	//
 	// This method returns the expression operator (BO_AND/BO_OR/BO_NONE) if the
@@ -67,8 +94,45 @@ public:
 	//
 	int32_t get_expr_boolop() const;
 
+	//
+	// The children, to look at. The list cannot be changed from outside, but the children can:
+	// const does not reach through a unique_ptr. Changing a child expression's own children goes
+	// through its methods, which re-resolve its walk (see compare()). What they cannot see is a
+	// filter that has already run and cached where its evaluation starts below the single-child
+	// expressions leading there: restructuring one of those would leave the filter evaluating a
+	// node the change freed. They are marked when the filter caches its entry, and a debug build
+	// refuses to restructure them. A filter's own methods forget the entry first.
+	//
+	const std::vector<std::unique_ptr<sinsp_filter_check>>& get_checks() const { return m_checks; }
+
 	sinsp_filter_expression* m_parent = nullptr;
+
+private:
+	friend class sinsp_filter;
+
+	// Set while a filter has cached its evaluation entry below this expression. See get_checks().
+	bool m_on_cached_path = false;
+	void assert_not_on_cached_path() const {
+		ASSERT(!m_on_cached_path &&
+		       "restructuring an expression its filter has cached a path through");
+	}
+
+	//
+	// Everything the walk needs to know about one child, decided once instead of on every
+	// event: which check to run, whether its result is negated, and the running value that
+	// says the walk can stop before running it at all. The check is owned by m_checks.
+	//
+	struct child_op {
+		sinsp_filter_check* m_check;
+		bool m_negate;
+		bool m_stop_on;
+	};
+
+	void resolve_children();
+
 	std::vector<std::unique_ptr<sinsp_filter_check>> m_checks;
+	std::vector<child_op> m_child_ops;
+	bool m_children_resolved = false;
 };
 
 /*!
@@ -79,16 +143,37 @@ public:
 	sinsp_filter();
 	virtual ~sinsp_filter() = default;
 
+	// Not thread-safe, as it never was: the first run works out where evaluation starts, and each
+	// check resolves its comparison on its first event.
 	bool run(sinsp_evt* evt);
 
 	void push_expression(boolop op);
 	void pop_expression();
 	void add_check(std::unique_ptr<sinsp_filter_check> chk);
 
-	std::unique_ptr<sinsp_filter_expression> m_filter;
+	//
+	// The tree, to look at. There is no way to replace it from outside: where evaluation starts
+	// is worked out from the tree's shape, so a tree swapped from outside would leave a filter
+	// evaluating a fragment of itself. For changing what is inside it, see
+	// sinsp_filter_expression::get_checks().
+	//
+	const sinsp_filter_expression* get_root() const { return m_filter.get(); }
 
 private:
+	//
+	// Where evaluating this filter starts. The root expression holds one child and nothing
+	// else -- the expression the filter turned out to be, or its single check -- so running the
+	// root would walk a level that only forwards an answer. Resolved on the first event,
+	// because the tree is not final until then. Owned by m_filter.
+	//
+	void resolve_entry();
+	// Forgets the entry, and the path it was cached through, before the tree changes.
+	void invalidate_entry();
+
+	std::unique_ptr<sinsp_filter_expression> m_filter;
 	sinsp_filter_expression* m_curexpr;
+	sinsp_filter_check* m_entry = nullptr;
+	bool m_entry_negate = false;
 };
 
 class sinsp_filter_factory {
@@ -145,6 +230,9 @@ public:
 		std::string shortdesc;
 
 		std::list<filter_field_info> fields;
+
+		// True if this field class applies to all event sources (not tied to any specific one).
+		bool is_generic = false;
 
 		// Print a terminal-friendly representation of this
 		// field class, including name, description, supported

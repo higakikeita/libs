@@ -18,8 +18,6 @@ limitations under the License.
 
 #pragma once
 
-#define DEFAULT_EXPIRED_CHILDREN_THRESHOLD 10
-
 #include <array>
 #include <atomic>
 #include <functional>
@@ -109,6 +107,12 @@ public:
 	bool remove_inactive_threads();
 	void fix_sockets_coming_from_proc(bool resolve_hostname_and_port);
 
+	// Shares content-identical fd entries between the tables built by the
+	// initial /proc scan (fork-inherited fds appear once per process there);
+	// copy-on-write covers any later divergence. Only meaningful right after
+	// the initial scan.
+	void deduplicate_fd_tables();
+
 	void reset_child_dependencies();
 	void create_thread_dependencies_after_proc_scan();
 	/*!
@@ -146,6 +150,21 @@ public:
 	  for read-only lookups. \return shared_ptr to the thread info, or empty if not found.
 	*/
 	typename threadinfo_map_impl_t<SyncPolicy>::ptr_t find_thread(int64_t tid, bool lookup_only);
+
+	/*!
+	  \brief Get the parent of this thread. If the parent is dead, follow it to its reaper.
+
+	  \return Pointer to the threadinfo, or NULL if it does not exist
+	*/
+	typename threadinfo_map_impl_t<SyncPolicy>::ptr_t get_parent_thread(
+	        const sinsp_threadinfo_impl<SyncPolicy>& tinfo);
+
+	/*!
+	  \brief Link the process of this thread past its dead parents. Also link it to a parent
+	  known only by its tid, if the table has that parent now. Clone and execve call this,
+	  because they write the process anyway.
+	*/
+	void update_parent_link(sinsp_threadinfo_impl<SyncPolicy>& tinfo);
 
 	/*!
 	  \brief Get the process that launched this thread's process (its parent) or any of its
@@ -332,8 +351,23 @@ public:
 	        bool resolve_hostname_and_port);
 
 private:
-	void remove_child_from_parent(int64_t ptid,
-	                              const std::shared_ptr<sinsp_threadinfo_impl<SyncPolicy>>& child);
+	/* Make the group of `last_thread` a tombstone, linked to its reaper if sinsp finds one. */
+	void bury_thread_group(sinsp_threadinfo_impl<SyncPolicy>& last_thread);
+
+	/* If the parent of the process of this thread is dead, link the process to the parent that a
+	 * reader gets.
+	 */
+	void link_past_dead_parents(sinsp_threadinfo_impl<SyncPolicy>& tinfo);
+
+	/* Link the new group of `tinfo` to the parent named by `ptid`, and publish it. */
+	void link_and_publish_group(const std::shared_ptr<sinsp_threadinfo_impl<SyncPolicy>>& tinfo,
+	                            const std::shared_ptr<thread_group_info>& tginfo,
+	                            int64_t ptid);
+
+	/* Link a group to `parent`. If the link is refused, leave the group unlinked, with `ptid`. */
+	void relink_group(thread_group_info& tginfo,
+	                  const std::shared_ptr<sinsp_threadinfo_impl<SyncPolicy>>& parent,
+	                  int64_t ptid);
 
 	inline void clear_thread_pointers(sinsp_threadinfo_impl<SyncPolicy>& threadinfo);
 	void free_dump_fdinfos(std::vector<scap_fdinfo*>* fdinfos_to_free);

@@ -167,14 +167,30 @@ public:
 	 * `online_only` is taken into account only if `buffers_num` >= 0 && `buffers_num` <= 1:
 	 * it allows to require allocation of buffers only for online CPUs and not for all
 	 * system-available CPUs.
+	 *
+	 * `disable_iterators` disables the BPF iterator support for synchronous information fetching,
+	 * letting scap falling back to the procfs lookups.
 	 */
 	virtual void open_modern_bpf(
 	        unsigned long driver_buffer_bytes_dim = DEFAULT_DRIVER_BUFFER_BYTES_DIM,
 	        double buffers_num = DEFAULT_BUFFERS_NUM,
 	        int iters_num = DEFAULT_ITERS_NUM,
 	        bool online_only = true,
-	        const libsinsp::events::set<ppm_sc_code>& ppm_sc_of_interest = {});
+	        const libsinsp::events::set<ppm_sc_code>& ppm_sc_of_interest = {},
+	        bool disable_iterators = false);
 	virtual void open_test_input(scap_test_input_data* data, sinsp_mode_t mode = SINSP_MODE_TEST);
+	/*!
+	\brief Process a .scap file using a memory buffer.
+
+	The memory buffer must contain one or more scap/pcapng blocks,
+	including the block type, block total length, block body, and block
+	total length (again). It must be processed with \ref next.
+
+	\param buffer_ptr a pointer to the buffer.
+	\param buffer_size_ptr a pointer to the size of the buffer.
+
+	*/
+	virtual void open_raw_block(uint8_t** buffer_ptr, uint64_t* buffer_size_ptr);
 
 	void fseek(uint64_t filepos) { scap_fseek(m_h, filepos); }
 

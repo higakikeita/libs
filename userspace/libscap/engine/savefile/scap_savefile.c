@@ -60,6 +60,63 @@ inline static int read_block_header(struct savefile_engine *handle,
 	return res;
 }
 
+static int32_t validate_v2_event(struct savefile_engine *handle,
+                                 const scap_evt *event,
+                                 uint32_t avail) {
+	if(event->len < sizeof(struct ppm_evt_hdr)) {
+		return scap_errprintf(handle->m_lasterr,
+		                      0,
+		                      "invalid event: len %u is smaller than the event header size %zu",
+		                      event->len,
+		                      sizeof(struct ppm_evt_hdr));
+	}
+
+	if(event->len > avail) {
+		return scap_errprintf(handle->m_lasterr,
+		                      0,
+		                      "invalid event: len %u is larger than the %u bytes "
+		                      "available in the block",
+		                      event->len,
+		                      avail);
+	}
+
+	const uint32_t len_size = (g_event_info[event->type].flags & EF_LARGE_PAYLOAD)
+	                                  ? sizeof(uint32_t)
+	                                  : sizeof(uint16_t);
+	uint64_t param_offset = sizeof(struct ppm_evt_hdr) + (uint64_t)event->nparams * len_size;
+	if(param_offset > event->len) {
+		return scap_errprintf(handle->m_lasterr,
+		                      0,
+		                      "invalid event: nparams %u does not fit in event len %u",
+		                      event->nparams,
+		                      event->len);
+	}
+
+	const char *lens = (const char *)event + sizeof(struct ppm_evt_hdr);
+	for(uint32_t i = 0; i < event->nparams; i++) {
+		uint32_t param_len;
+		if(len_size == sizeof(uint32_t)) {
+			memcpy(&param_len, lens + i * len_size, sizeof(uint32_t));
+		} else {
+			uint16_t param_len16;
+			memcpy(&param_len16, lens + i * len_size, sizeof(uint16_t));
+			param_len = param_len16;
+		}
+
+		if(param_len > event->len - param_offset) {
+			return scap_errprintf(handle->m_lasterr,
+			                      0,
+			                      "invalid event: param %u len %u exceeds event len %u",
+			                      i,
+			                      param_len,
+			                      event->len);
+		}
+		param_offset += param_len;
+	}
+
+	return SCAP_SUCCESS;
+}
+
 //
 // Load the machine info block
 //
@@ -1545,6 +1602,7 @@ static int32_t scap_read_fdlist(scap_reader_t *r,
 	totreadsize += readsize;
 
 	while(((int32_t)block_length - (int32_t)totreadsize) >= 4) {
+		memset(&fdi, 0, sizeof(fdi));
 		if(scap_fd_read_from_disk(&fdi, &readsize, block_type, r, error) != SCAP_SUCCESS) {
 			return SCAP_FAILURE;
 		}
@@ -1674,11 +1732,14 @@ static int32_t _scap_read_init(struct savefile_engine *handle,
 		readsize = read_block_header(handle, r, &bh);
 
 		//
-		// If we don't find the event block header,
-		// it means there is no event in the file.
+		// Clean end of the block stream after the metadata blocks, without any event
+		// block. This is a valid parse; on return handle->m_use_last_block_header is left
+		// false (no event block header was cached). Engines that require events (the
+		// savefile engine) detect this via that flag, while the raw_block engine expects
+		// it: its event blocks arrive in a separate, later buffer.
 		//
 		if(readsize == 0 && !found_ev) {
-			return scap_errprintf(error, 0, "no events in file");
+			return SCAP_SUCCESS;
 		}
 
 		CHECK_READ_SIZE_ERR(readsize, sizeof(bh), error);
@@ -1813,13 +1874,13 @@ static int32_t _scap_read_init(struct savefile_engine *handle,
 //
 // Parse the headers of a trace file and load the tables
 //
-static int32_t scap_read_init(struct savefile_engine *handle,
-                              scap_reader_t *r,
-                              scap_machine_info *machine_info_p,
-                              struct scap_proclist *proclist_p,
-                              scap_addrlist **addrlist_p,
-                              scap_userlist **userlist_p,
-                              char *error) {
+int32_t scap_savefile_read_init(struct savefile_engine *handle,
+                                scap_reader_t *r,
+                                scap_machine_info *machine_info_p,
+                                struct scap_proclist *proclist_p,
+                                scap_addrlist **addrlist_p,
+                                scap_userlist **userlist_p,
+                                char *error) {
 	proclist_p->m_callbacks.m_refresh_start_cb(proclist_p->m_callbacks.m_callback_context);
 	int32_t rc =
 	        _scap_read_init(handle, r, machine_info_p, proclist_p, addrlist_p, userlist_p, error);
@@ -1827,10 +1888,10 @@ static int32_t scap_read_init(struct savefile_engine *handle,
 	return rc;
 }
 
-static int32_t next_event_from_file(struct savefile_engine *handle,
-                                    scap_evt **pevent,
-                                    uint16_t *pdevid,
-                                    uint32_t *pflags) {
+int32_t scap_savefile_next_event_from_file(struct savefile_engine *handle,
+                                           scap_evt **pevent,
+                                           uint16_t *pdevid,
+                                           uint32_t *pflags) {
 	block_header bh;
 	size_t readsize;
 	uint32_t readlen;
@@ -1903,6 +1964,8 @@ static int32_t next_event_from_file(struct savefile_engine *handle,
 		// Read the event
 		//
 		readlen = bh.block_total_length - sizeof(bh);
+		const uint32_t block_body_len =
+		        readlen >= sizeof(uint32_t) ? readlen - sizeof(uint32_t) : 0;
 		// Non-large block types have an uint16_max maximum size
 		if(bh.block_type != EV_BLOCK_TYPE_V2_LARGE && bh.block_type != EVF_BLOCK_TYPE_V2_LARGE) {
 			if(readlen > READER_BUF_SIZE) {
@@ -1945,6 +2008,23 @@ static int32_t next_event_from_file(struct savefile_engine *handle,
 		} else {
 			*pflags = 0;
 			*pevent = (struct ppm_evt_hdr *)(handle->m_reader_evt_buf + sizeof(uint16_t));
+		}
+
+		// Number of block-body bytes that follow *pevent in the reader buffer, excluding the
+		// trailing block_total_length. Compute it with a guarded subtraction: readlen and evt_off
+		// both derive from the attacker-controlled block length, so avoid unsigned underflow.
+		uint32_t evt_off = (uint32_t)((char *)*pevent - handle->m_reader_evt_buf);
+		uint32_t avail = evt_off <= block_body_len ? block_body_len - evt_off : 0;
+		if(avail < hdr_len) {
+			return scap_errprintf(
+			        handle->m_lasterr,
+			        0,
+			        "event header exceeds block payload: block length %u, event offset %u, "
+			        "available %u, header size %u",
+			        (uint32_t)bh.block_total_length,
+			        evt_off,
+			        avail,
+			        (uint32_t)hdr_len);
 		}
 
 		if((*pevent)->type >= PPM_EVENT_MAX) {
@@ -2029,6 +2109,17 @@ static int32_t next_event_from_file(struct savefile_engine *handle,
 			// the event. To do so we'd have to check to see if the block data len exceeds
 			// (*pevent)->len and parse the excess as block options.
 			//
+		} else {
+			//
+			// For V2/V2_LARGE blocks the event header `len` (and `nparams`) are taken
+			// verbatim from the file and, unlike the old-format path above, are never
+			// recomputed. Validate the event shape before the event reaches conversion or
+			// downstream consumers.
+			//
+			int32_t res = validate_v2_event(handle, *pevent, avail);
+			if(res != SCAP_SUCCESS) {
+				return res;
+			}
 		}
 
 		break;
@@ -2040,12 +2131,12 @@ static int32_t next_event_from_file(struct savefile_engine *handle,
 //
 // Read an event from disk
 //
-static int32_t next(struct scap_engine_handle engine,
-                    scap_evt **pevent,
-                    uint16_t *pdevid,
-                    uint32_t *pflags) {
+int32_t scap_savefile_next(struct scap_engine_handle engine,
+                           scap_evt **pevent,
+                           uint16_t *pdevid,
+                           uint32_t *pflags) {
 	struct savefile_engine *handle = engine.m_handle;
-	int32_t res = next_event_from_file(handle, pevent, pdevid, pflags);
+	int32_t res = scap_savefile_next_event_from_file(handle, pevent, pdevid, pflags);
 	// If we fail we don't convert the event.
 	if(res != SCAP_SUCCESS) {
 		return res;
@@ -2086,11 +2177,25 @@ static int32_t next(struct scap_engine_handle engine,
 	conv_res = CONVERSION_CONTINUE;
 	for(conv_num = 0; conv_num < MAX_CONVERSION_BOUNDARY && conv_res == CONVERSION_CONTINUE;
 	    conv_num++) {
+		// The conversion staging buffers (m_to_convert_evt / m_new_evt) are MAX_EVENT_SIZE
+		// bytes. Refuse to convert any event whose len would overflow them. This guards
+		// against a crafted V2_LARGE block whose len exceeds MAX_EVENT_SIZE while all its
+		// bytes are present in the (reallocated) reader buffer: such an event passes the
+		// in-buffer bound checked in next_event_from_file() but would still overflow the
+		// fixed-size conversion storage here.
+		if((*pevent)->len > MAX_EVENT_SIZE) {
+			return scap_errprintf(handle->m_lasterr,
+			                      0,
+			                      "invalid event: len %u is larger than the maximum event size %u",
+			                      (*pevent)->len,
+			                      MAX_EVENT_SIZE);
+		}
 		// Before each conversion we move the current event into the storage.
 		memcpy(handle->m_to_convert_evt, *pevent, (*pevent)->len);
 		conv_res = scap_convert_event(handle->m_converter_buf,
 		                              (scap_evt *)handle->m_new_evt,
 		                              (scap_evt *)handle->m_to_convert_evt,
+		                              MAX_EVENT_SIZE,
 		                              handle->m_lasterr);
 		// At the end of the conversion in any case we switch to the new event pointer.
 		*pevent = (scap_evt *)handle->m_new_evt;
@@ -2275,13 +2380,20 @@ static int32_t init(struct scap *main_handle, struct scap_open_args *oargs) {
 
 	handle->m_use_last_block_header = false;
 
-	res = scap_read_init(handle,
-	                     reader,
-	                     &platform->m_machine_info,
-	                     &platform->m_proclist,
-	                     &platform->m_addrlist,
-	                     &platform->m_userlist,
-	                     main_handle->m_lasterr);
+	res = scap_savefile_read_init(handle,
+	                              reader,
+	                              &platform->m_machine_info,
+	                              &platform->m_proclist,
+	                              &platform->m_addrlist,
+	                              &platform->m_userlist,
+	                              main_handle->m_lasterr);
+
+	// A savefile must contain at least one event block; read_init leaves
+	// m_use_last_block_header false when it reached the end of the file after the
+	// metadata blocks without finding one.
+	if(res == SCAP_SUCCESS && !handle->m_use_last_block_header) {
+		res = scap_errprintf(main_handle->m_lasterr, 0, "no events in file");
+	}
 
 	if(res != SCAP_SUCCESS) {
 		reader->close(reader);
@@ -2351,13 +2463,20 @@ static int32_t scap_savefile_restart_capture(scap_t *handle) {
 
 	scap_platform_close(platform);
 
-	if((res = scap_read_init(engine,
-	                         engine->m_reader,
-	                         &platform->m_machine_info,
-	                         &platform->m_proclist,
-	                         &platform->m_addrlist,
-	                         &platform->m_userlist,
-	                         handle->m_lasterr)) != SCAP_SUCCESS) {
+	res = scap_savefile_read_init(engine,
+	                              engine->m_reader,
+	                              &platform->m_machine_info,
+	                              &platform->m_proclist,
+	                              &platform->m_addrlist,
+	                              &platform->m_userlist,
+	                              handle->m_lasterr);
+
+	// A savefile must contain at least one event block (see scap_savefile init).
+	if(res == SCAP_SUCCESS && !engine->m_use_last_block_header) {
+		res = scap_errprintf(handle->m_lasterr, 0, "no events in file");
+	}
+
+	if(res != SCAP_SUCCESS) {
 		char error_copy[SCAP_LASTERR_SIZE];
 		scap_errprintf(error_copy, 0, "%s", scap_getlasterr(handle));
 		scap_errprintf(handle->m_lasterr, 0, "could not restart capture: %s", error_copy);
@@ -2385,7 +2504,7 @@ struct scap_vtable scap_savefile_engine = {
         .init = init,
         .free_handle = free_handle,
         .close = scap_savefile_close,
-        .next = next,
+        .next = scap_savefile_next,
         .next_from_buffer = noop_next_from_buffer,
         .get_n_allocated_buffer_handles = noop_get_n_allocated_buffer_handles,
         .reserve_buffer_handle = noop_reserve_buffer_handle,
