@@ -594,6 +594,10 @@ void sinsp_parser::parse_clone_exit_caller(sinsp_evt &evt,
 	 * leaks until the next autopurge cycle.
 	 */
 	if(m_params->m_multi_thread_mode) {
+		/* The only thing we do is capturing the state the child inherits, see
+		 * sinsp_ctx_sync (fork snapshot handoff).
+		 */
+		publish_clone_snapshot(evt, child_tid);
 		return;
 	}
 
@@ -1064,6 +1068,115 @@ void sinsp_parser::wait_for_parent_partition(const sinsp_evt &evt, const int64_t
 	m_params->m_ctx_sync->wait_for(m_buffer_idx, target, evt.get_ts());
 }
 
+// A child inherits state from its parent only if it is a new process of the init pid namespace
+// that is a child of the caller: not a thread, not in a container and not CLONE_PARENT (these cases
+// are not handled by the caller parser either, see parse_clone_exit_caller).
+static bool clone_snapshot_eligible(uint32_t flags, int64_t tid, int64_t vtid) {
+	return !(flags & (PPM_CL_CLONE_THREAD | PPM_CL_CHILD_IN_PIDNS | PPM_CL_CLONE_NEWPID |
+	                  PPM_CL_CLONE_PARENT)) &&
+	       tid == vtid;
+}
+
+static sinsp_ctx_sync::payload_t clone_snapshot_to_payload(std::unique_ptr<sinsp_threadinfo> t) {
+	return sinsp_ctx_sync::payload_t(t.release(),
+	                                 [](void *p) { delete static_cast<sinsp_threadinfo *>(p); });
+}
+
+static std::unique_ptr<sinsp_threadinfo> clone_snapshot_from_payload(
+        sinsp_ctx_sync::payload_t payload) {
+	return std::unique_ptr<sinsp_threadinfo>(static_cast<sinsp_threadinfo *>(payload.release()));
+}
+
+std::unique_ptr<sinsp_threadinfo> sinsp_parser::make_clone_snapshot(
+        sinsp_threadinfo &parent) const {
+	const sinsp_fdtable *fd_table = parent.get_fd_table();
+	if(fd_table == nullptr) {
+		return nullptr;
+	}
+	auto snap = m_params->m_threadinfo_factory.create();
+	snap->set_exepath(std::string(parent.get_exepath()));
+	snap->set_exe_writable(parent.get_exe_writable());
+	snap->set_exe_upper_layer(parent.get_exe_upper_layer());
+	snap->set_exe_lower_layer(parent.get_exe_lower_layer());
+	snap->set_exe_from_memfd(parent.get_exe_from_memfd());
+	snap->set_root(parent.get_root());
+	snap->set_sid(parent.get_sid());
+	snap->set_vpgid(parent.get_vpgid());
+	snap->set_pgid(parent.get_pgid());
+	snap->set_tty(parent.get_tty());
+	snap->set_loginuid(parent.get_loginuid());
+	snap->set_cap_permitted(parent.get_cap_permitted());
+	snap->set_cap_inheritable(parent.get_cap_inheritable());
+	snap->set_cap_effective(parent.get_cap_effective());
+	snap->set_exe_ino(parent.get_exe_ino());
+	snap->set_exe_ino_ctime(parent.get_exe_ino_ctime());
+	snap->set_exe_ino_mtime(parent.get_exe_ino_mtime());
+	snap->set_exe_ino_ctime_duration_clone_ts(parent.get_exe_ino_ctime_duration_clone_ts());
+	// With the concurrent policy this copies the entries: the tables of the parent and of the
+	// child are used by different workers and are never shared.
+	snap->get_fdtable().share_from(*fd_table);
+	snap->set_cwd(parent.get_cwd());
+	snap->set_env(parent.get_env());
+	return snap;
+}
+
+void sinsp_parser::publish_clone_snapshot(sinsp_evt &evt, int64_t child_tid) const {
+	auto *sync = m_params->m_ctx_sync.get();
+	if(sync == nullptr || !sync->handoff_enabled()) {
+		return;
+	}
+	const int64_t caller_tid = evt.get_tid();
+	const auto caller = m_params->m_thread_manager->find_thread(caller_tid, true);
+	if(caller == nullptr || caller->is_invalid()) {
+		return;
+	}
+	// `caller_tid == caller vtid` tells that the caller is in the init pid namespace.
+	const auto flags = evt.get_param(15)->as<uint32_t>();
+	if(!clone_snapshot_eligible(flags, caller_tid, caller->get_vtid())) {
+		return;
+	}
+	if(sync->handoff_child_done(child_tid, caller_tid, evt.get_ts())) {
+		return;  // the child was created already, from the live state of this thread
+	}
+	if(auto snap = make_clone_snapshot(*caller)) {
+		sync->handoff_put(child_tid,
+		                  caller_tid,
+		                  evt.get_ts(),
+		                  clone_snapshot_to_payload(std::move(snap)));
+	}
+}
+
+std::unique_ptr<sinsp_threadinfo> sinsp_parser::take_clone_snapshot(sinsp_evt &evt,
+                                                                    int64_t child_tid) const {
+	auto *sync = m_params->m_ctx_sync.get();
+	if(!m_params->m_multi_thread_mode || sync == nullptr || !sync->handoff_enabled()) {
+		return nullptr;
+	}
+	const int64_t ptid = evt.get_param(5)->as<int64_t>();
+	const auto vtid_param = evt.get_param(18);
+	const int64_t vtid = vtid_param->empty() ? child_tid : vtid_param->as<int64_t>();
+	if(ptid <= 0 || !clone_snapshot_eligible(evt.get_param(15)->as<uint32_t>(), child_tid, vtid)) {
+		return nullptr;
+	}
+	if(auto payload = sync->handoff_take(child_tid, ptid, evt.get_ts())) {
+		return clone_snapshot_from_payload(std::move(payload));
+	}
+	// The parent's worker did not reach its clone exit (yet): wait for everything that happened
+	// before the clone, then copy the live parent. The claim makes the parent's worker skip its
+	// own copy, and keeps it from moving past the clone exit while we read its state.
+	wait_for_parent_partition(evt, ptid);
+	return clone_snapshot_from_payload(
+	        sync->handoff_claim_live(child_tid, ptid, evt.get_ts(), [&]() {
+		        const auto parent = m_params->m_thread_manager->find_thread(ptid, true);
+		        if(parent == nullptr || parent->is_invalid()) {
+			        return sinsp_ctx_sync::no_payload();
+		        }
+		        auto snap = make_clone_snapshot(*parent);
+		        return snap ? clone_snapshot_to_payload(std::move(snap))
+		                    : sinsp_ctx_sync::no_payload();
+	        }));
+}
+
 void sinsp_parser::parse_clone_exit_child(sinsp_evt &evt, sinsp_parser_verdict &verdict) const {
 	int64_t child_tid = evt.get_tid();
 
@@ -1109,10 +1222,18 @@ void sinsp_parser::parse_clone_exit_child(sinsp_evt &evt, sinsp_parser_verdict &
 	 * - The new process lives in a container.
 	 */
 
+	/* In multi-worker mode the state to inherit was captured by the worker of the parent at its
+	 * own clone exit (or is captured now, see sinsp_ctx_sync): the live parent can be ahead of the
+	 * clone. The snapshot is a detached thread info that becomes the child.
+	 */
+	auto snapshot = take_clone_snapshot(evt, child_tid);
+	const bool snapshot_adopted = snapshot != nullptr;
+
 	/* Allocate the new thread info and initialize it.
 	 * We must avoid `malloc` here and get the item from a preallocated list.
 	 */
-	auto child_tinfo = m_params->m_threadinfo_factory.create();
+	auto child_tinfo = snapshot_adopted ? std::move(snapshot)
+	                                    : m_params->m_threadinfo_factory.create();
 
 	/* Initialise last exec time to zero (can be overridden in the case of a
 	 * thread clone)
@@ -1170,7 +1291,9 @@ void sinsp_parser::parse_clone_exit_child(sinsp_evt &evt, sinsp_parser_verdict &
 		 * ahead of this one: wait (bounded) until it has processed everything that happened
 		 * before this clone, so the state we copy is the one of the clone time.
 		 */
-		wait_for_parent_partition(evt, lookup_tid);
+		if(!snapshot_adopted) {
+			wait_for_parent_partition(evt, lookup_tid);
+		}
 	} else {
 		/* We need to copy data from the thread leader */
 		lookup_tid = child_tinfo->get_pid();
@@ -1240,7 +1363,10 @@ void sinsp_parser::parse_clone_exit_child(sinsp_evt &evt, sinsp_parser_verdict &
 	/* args */
 	child_tinfo->set_args(evt.get_param(2)->as<std::vector<std::string>>());
 
-	if(valid_lookup_thread) {
+	if(snapshot_adopted) {
+		/* The state of the parent is already in the child, see above. */
+		child_tinfo->get_fdtable().set_tid(child_tinfo->m_tid);
+	} else if(valid_lookup_thread) {
 		/* Please note that these data could be wrong if the lookup thread
 		 * is not the caller! for example, if the child is created by a thread
 		 * the thread could have different info with respect to the thread leader,

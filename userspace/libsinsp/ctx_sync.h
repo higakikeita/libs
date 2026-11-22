@@ -20,8 +20,11 @@ limitations under the License.
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 /**
  * @brief Cross-partition "context synchronization" of the multi-worker mode (prototype).
@@ -62,13 +65,36 @@ public:
 		// on it would stall for the whole timeout.
 		uint64_t backoff_ns = 50'000'000;
 		bool enabled = true;
+		// Fork snapshot handoff (see below).
+		bool handoff_enabled = true;
+		// Maximum number of pending handoff entries (snapshots and claims), over all shards.
+		size_t handoff_max_entries = 1024;
+		// An entry older than this (in event time, relative to the newest entry of its shard) is
+		// dropped: it bounds the memory held by snapshots nobody consumed.
+		uint64_t handoff_ttl_ns = 10'000'000'000;
+		// The largest distance between the clone exit of the parent and the one of the child for
+		// an entry to be matched (protects against the reuse of a tid).
+		uint64_t handoff_match_ns = 2'000'000'000;
 	};
+
+	// The state a child inherits, captured by the parent's worker. Opaque for this class.
+	using payload_t = std::unique_ptr<void, void (*)(void*)>;
+	static payload_t no_payload() { return payload_t(nullptr, [](void*) {}); }
 
 	struct stats {
 		uint64_t waits;     // waits that were not satisfied by the first check
 		uint64_t timeouts;  // waits that gave up
 		uint64_t wait_ns;   // total time spent in the waits that were not immediate
 		uint64_t skipped;   // waits not even started because of the backoff after a timeout
+	};
+
+	struct handoff_stats {
+		uint64_t put;           // snapshots taken by a parent
+		uint64_t consumed;      // snapshots used by a child
+		uint64_t live_copies;   // children that had no snapshot and copied the live parent
+		uint64_t skipped_puts;  // parents that found the child already created and did not copy
+		uint64_t dropped;       // entries dropped because of the size limit or the age
+		uint64_t pending;       // entries currently held
 	};
 
 	using clock_fn = std::function<uint64_t()>;
@@ -131,8 +157,68 @@ public:
 	stats get_stats() const;
 	void reset_stats();
 
+	// --- fork snapshot handoff ---
+	// The watermark wait cannot fix this: the parent opens an fd AFTER the clone, but its worker
+	// is AHEAD of the one of the child, so the clone exit of the child (which copies the live state
+	// of the parent) sees the fd. The fix: the worker of the parent captures the state the child
+	// inherits while it processes its own clone exit, in order with the parent's later events, and
+	// hands it over keyed by the child tid. The child uses the snapshot instead of the live parent.
+	//
+	// If the child gets there first it copies the live parent (after the watermark wait) and
+	// leaves a claim: the parent then neither copies nor publishes anything. The claim section
+	// and the publication of the snapshot are serialized by a shard lock, so the parent cannot
+	// proceed to its next event while the child is reading the live parent.
+	// Every entry carries the event time of its creation; the entries older than the ttl are
+	// dropped, and so are the oldest ones when the maximum size is exceeded (a snapshot that is
+	// never consumed, e.g. because the child event was lost, never accumulates).
+	bool handoff_enabled() const { return enabled() && m_cfg.handoff_enabled; }
+
+	// Parent side, before copying: true if the child was created already (it left a claim).
+	bool handoff_child_done(int64_t child_tid, int64_t parent_tid, uint64_t ts);
+	// Parent side: publishes the snapshot. Returns false (and drops it) if the child claimed
+	// the slot in the meantime.
+	bool handoff_put(int64_t child_tid, int64_t parent_tid, uint64_t ts, payload_t payload);
+	// Child side: the snapshot of the parent, or an empty payload.
+	payload_t handoff_take(int64_t child_tid, int64_t parent_tid, uint64_t ts);
+	// Child side, no snapshot: runs `copy_live` (which copies the live parent) under the shard
+	// lock and leaves a claim, unless `copy_live` returns an empty payload.
+	payload_t handoff_claim_live(int64_t child_tid,
+	                             int64_t parent_tid,
+	                             uint64_t ts,
+	                             const std::function<payload_t()>& copy_live);
+
+	handoff_stats get_handoff_stats() const;
+	size_t handoff_pending() const;
+
 private:
 	bool wait_slow(uint16_t target, uint64_t ts);
+
+	static constexpr size_t HANDOFF_SHARDS = 16;
+	struct handoff_entry {
+		int64_t parent_tid;
+		uint64_t ts;
+		uint64_t seq;
+		payload_t payload;  // empty: the child claimed the slot
+	};
+	struct alignas(64) handoff_shard {
+		mutable std::mutex mtx;
+		std::unordered_map<int64_t, handoff_entry> map;
+		std::deque<std::pair<int64_t, uint64_t>> order;  // (child tid, seq), oldest first
+		uint64_t next_seq = 0;
+	};
+	handoff_shard& shard_of(int64_t child_tid) {
+		return m_handoff[static_cast<uint64_t>(child_tid) % HANDOFF_SHARDS];
+	}
+	// Returns the live entry for the child, erasing it if stale (too old or another parent).
+	handoff_entry* find_fresh(handoff_shard& sh,
+	                          int64_t child_tid,
+	                          int64_t parent_tid,
+	                          uint64_t ts);
+	void insert_locked(handoff_shard& sh,
+	                   int64_t child_tid,
+	                   int64_t parent_tid,
+	                   uint64_t ts,
+	                   payload_t payload);
 
 	struct alignas(64) slot {
 		std::atomic<uint64_t> wm{0};
@@ -148,4 +234,11 @@ private:
 	std::atomic<uint64_t> m_timeouts{0};
 	std::atomic<uint64_t> m_skipped{0};
 	std::atomic<uint64_t> m_wait_ns{0};
+
+	handoff_shard m_handoff[HANDOFF_SHARDS];
+	std::atomic<uint64_t> m_h_put{0};
+	std::atomic<uint64_t> m_h_consumed{0};
+	std::atomic<uint64_t> m_h_live{0};
+	std::atomic<uint64_t> m_h_skipped{0};
+	std::atomic<uint64_t> m_h_dropped{0};
 };

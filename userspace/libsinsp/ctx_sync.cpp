@@ -19,6 +19,7 @@ limitations under the License.
 #include <libsinsp/ctx_sync.h>
 #include <libsinsp/utils.h>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -27,6 +28,11 @@ sinsp_ctx_sync::sinsp_ctx_sync(): m_clock(&sinsp_utils::get_current_time_ns) {}
 void sinsp_ctx_sync::init(uint16_t n_buffers) {
 	m_n_buffers = n_buffers;
 	m_slots = n_buffers > 0 ? std::make_unique<slot[]>(n_buffers) : nullptr;
+	for(auto& sh : m_handoff) {
+		std::lock_guard<std::mutex> lock(sh.mtx);
+		sh.map.clear();
+		sh.order.clear();
+	}
 	reset_stats();
 }
 
@@ -92,4 +98,135 @@ void sinsp_ctx_sync::reset_stats() {
 	m_timeouts = 0;
 	m_wait_ns = 0;
 	m_skipped = 0;
+	m_h_put = 0;
+	m_h_consumed = 0;
+	m_h_live = 0;
+	m_h_skipped = 0;
+	m_h_dropped = 0;
+}
+
+sinsp_ctx_sync::handoff_entry* sinsp_ctx_sync::find_fresh(handoff_shard& sh,
+                                                          int64_t child_tid,
+                                                          int64_t parent_tid,
+                                                          uint64_t ts) {
+	const auto it = sh.map.find(child_tid);
+	if(it == sh.map.end()) {
+		return nullptr;
+	}
+	const uint64_t dist = ts > it->second.ts ? ts - it->second.ts : it->second.ts - ts;
+	if(it->second.parent_tid != parent_tid || dist > m_cfg.handoff_match_ns) {
+		// A previous use of the same tid, or an entry nobody consumed.
+		sh.map.erase(it);
+		m_h_dropped.fetch_add(1, std::memory_order_relaxed);
+		return nullptr;
+	}
+	return &it->second;
+}
+
+void sinsp_ctx_sync::insert_locked(handoff_shard& sh,
+                                   int64_t child_tid,
+                                   int64_t parent_tid,
+                                   uint64_t ts,
+                                   payload_t payload) {
+	const size_t max_per_shard = std::max<size_t>(1, m_cfg.handoff_max_entries / HANDOFF_SHARDS);
+	// Oldest first: drop what is expired or beyond the size limit. Stale `order` records (the
+	// entry was consumed or replaced) are just skipped.
+	while(!sh.order.empty()) {
+		const auto [tid, seq] = sh.order.front();
+		const auto it = sh.map.find(tid);
+		const bool live = it != sh.map.end() && it->second.seq == seq;
+		if(live && sh.map.size() < max_per_shard && it->second.ts + m_cfg.handoff_ttl_ns >= ts) {
+			break;
+		}
+		if(live) {
+			sh.map.erase(it);
+			m_h_dropped.fetch_add(1, std::memory_order_relaxed);
+		}
+		sh.order.pop_front();
+	}
+	const uint64_t seq = sh.next_seq++;
+	sh.map.insert_or_assign(child_tid, handoff_entry{parent_tid, ts, seq, std::move(payload)});
+	sh.order.emplace_back(child_tid, seq);
+}
+
+bool sinsp_ctx_sync::handoff_child_done(int64_t child_tid, int64_t parent_tid, uint64_t ts) {
+	auto& sh = shard_of(child_tid);
+	std::lock_guard<std::mutex> lock(sh.mtx);
+	auto* e = find_fresh(sh, child_tid, parent_tid, ts);
+	if(e == nullptr || e->payload) {
+		return false;
+	}
+	sh.map.erase(child_tid);
+	m_h_skipped.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+bool sinsp_ctx_sync::handoff_put(int64_t child_tid,
+                                 int64_t parent_tid,
+                                 uint64_t ts,
+                                 payload_t payload) {
+	auto& sh = shard_of(child_tid);
+	std::lock_guard<std::mutex> lock(sh.mtx);
+	if(auto* e = find_fresh(sh, child_tid, parent_tid, ts); e != nullptr && !e->payload) {
+		sh.map.erase(child_tid);  // the child claimed the slot while we were copying
+		m_h_skipped.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	insert_locked(sh, child_tid, parent_tid, ts, std::move(payload));
+	m_h_put.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+sinsp_ctx_sync::payload_t sinsp_ctx_sync::handoff_take(int64_t child_tid,
+                                                       int64_t parent_tid,
+                                                       uint64_t ts) {
+	auto& sh = shard_of(child_tid);
+	std::lock_guard<std::mutex> lock(sh.mtx);
+	auto* e = find_fresh(sh, child_tid, parent_tid, ts);
+	if(e == nullptr || !e->payload) {
+		return no_payload();
+	}
+	auto payload = std::move(e->payload);
+	sh.map.erase(child_tid);
+	m_h_consumed.fetch_add(1, std::memory_order_relaxed);
+	return payload;
+}
+
+sinsp_ctx_sync::payload_t sinsp_ctx_sync::handoff_claim_live(
+        int64_t child_tid,
+        int64_t parent_tid,
+        uint64_t ts,
+        const std::function<payload_t()>& copy_live) {
+	auto& sh = shard_of(child_tid);
+	std::lock_guard<std::mutex> lock(sh.mtx);
+	if(auto* e = find_fresh(sh, child_tid, parent_tid, ts); e != nullptr && e->payload) {
+		auto payload = std::move(e->payload);  // published while we were waiting
+		sh.map.erase(child_tid);
+		m_h_consumed.fetch_add(1, std::memory_order_relaxed);
+		return payload;
+	}
+	auto payload = copy_live();
+	if(payload) {
+		insert_locked(sh, child_tid, parent_tid, ts, no_payload());
+		m_h_live.fetch_add(1, std::memory_order_relaxed);
+	}
+	return payload;
+}
+
+sinsp_ctx_sync::handoff_stats sinsp_ctx_sync::get_handoff_stats() const {
+	return {m_h_put.load(std::memory_order_relaxed),
+	        m_h_consumed.load(std::memory_order_relaxed),
+	        m_h_live.load(std::memory_order_relaxed),
+	        m_h_skipped.load(std::memory_order_relaxed),
+	        m_h_dropped.load(std::memory_order_relaxed),
+	        handoff_pending()};
+}
+
+size_t sinsp_ctx_sync::handoff_pending() const {
+	size_t n = 0;
+	for(const auto& sh : m_handoff) {
+		std::lock_guard<std::mutex> lock(sh.mtx);
+		n += sh.map.size();
+	}
+	return n;
 }

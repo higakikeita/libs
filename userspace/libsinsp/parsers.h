@@ -153,6 +153,15 @@ private:
 	// the buffer of this parser.
 	void wait_for_parent_partition(const sinsp_evt& evt, int64_t ptid) const;
 
+	// Multi-worker mode, fork snapshot handoff (see sinsp_ctx_sync). Captures the state a child
+	// process inherits from `parent` (fd table, cwd, env, exe info...) in a detached thread info.
+	std::unique_ptr<sinsp_threadinfo> make_clone_snapshot(sinsp_threadinfo& parent) const;
+	// Caller side: captures the snapshot of the child, in order with the next events of the caller.
+	void publish_clone_snapshot(sinsp_evt& evt, int64_t child_tid) const;
+	// Child side: the snapshot of the parent at the clone, or nullptr (not eligible, no parent...).
+	std::unique_ptr<sinsp_threadinfo> take_clone_snapshot(sinsp_evt& evt,
+	                                                      int64_t child_tid) const;
+
 	//
 	// Parsers
 	//

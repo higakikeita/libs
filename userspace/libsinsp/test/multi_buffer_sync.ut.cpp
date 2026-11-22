@@ -29,6 +29,8 @@ limitations under the License.
 
 #include <sinsp_with_test_input.h>
 
+#include <malloc.h>
+
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -59,6 +61,12 @@ protected:
 	}
 
 	void emit_in_buffer_of(int64_t tgid) { route_to_buffer(buffer_for_tgid(tgid)); }
+
+	// The clone exit of the caller, in the buffer of the parent (see the fork snapshot handoff).
+	void parent_clone_returns(int64_t child_tid, int64_t parent_tid) {
+		emit_in_buffer_of(parent_tid);
+		generate_clone_x_event(child_tid, parent_tid, parent_tid, 0);
+	}
 
 	void child_is_created(int64_t child_tid, int64_t parent_tid) {
 		emit_in_buffer_of(child_tid);
@@ -151,13 +159,14 @@ TEST_P(multi_buffer_sync_repeat, fd_opened_before_clone_is_inherited_when_the_pa
 	EXPECT_EQ(m_inspector.get_ctx_sync().get_stats().timeouts, 0u);
 }
 
-// The parent opens the file AFTER the clone, and its worker is ahead of the one of the child.
-// KNOWN LIMIT, disabled: a watermark can make a worker wait for a partition that is behind, but it
-// cannot undo what a partition that is ahead has already done. Fixing this needs the parent to
-// hand over a snapshot of its state at its own clone exit (or versioned state). This is the
-// threaded twin of the DISABLED_ test of multi_buffer_order.ut.cpp.
+// The parent opens the file AFTER the clone, and its worker is ahead of the one of the child. The
+// watermark wait cannot undo what the parent already did: the worker of the parent captures the
+// state of the child at its own clone exit (fork snapshot handoff), and the child uses it. This is
+// the threaded twin of fd_opened_after_clone_is_not_inherited_when_the_open_is_early in
+// multi_buffer_order.ut.cpp.
 TEST_P(multi_buffer_sync_repeat,
-       DISABLED_fd_opened_after_clone_is_not_inherited_when_the_parent_worker_is_ahead) {
+       fd_opened_after_clone_is_not_inherited_when_the_parent_worker_is_ahead) {
+	parent_clone_returns(CHILD_TID, PARENT_TID);
 	child_is_created(CHILD_TID, PARENT_TID);
 	thread_opens_a_file(PARENT_TID, PARENT_FD);
 
@@ -165,8 +174,58 @@ TEST_P(multi_buffer_sync_repeat,
 	delay[buffer_for_tgid(CHILD_TID)] = 5;
 	run_workers(delay);
 
+	const auto st = m_inspector.get_ctx_sync().get_handoff_stats();
 	EXPECT_FALSE(child_has_fd(PARENT_FD))
-	        << "the child has an fd that the parent opened after the clone";
+	        << "the child has an fd that the parent opened after the clone (put=" << st.put
+	        << " consumed=" << st.consumed << " live=" << st.live_copies
+	        << " skipped=" << st.skipped_puts << " dropped=" << st.dropped << ")";
+	EXPECT_EQ(m_inspector.get_ctx_sync().get_stats().timeouts, 0u);
+	EXPECT_EQ(st.pending, 0u);
+}
+
+// Every start schedule (the parameter selects one of the 8 combinations), and the child event
+// older or newer than the one of the caller: the open after the clone must never be in the child,
+// the open before the clone always.
+TEST_P(multi_buffer_sync_repeat, the_snapshot_is_exact_for_every_schedule) {
+	const bool child_event_first = (GetParam() & 1) != 0;
+	const int parent_delay = (GetParam() & 2) != 0 ? 3 : 0;
+	const int child_delay = (GetParam() & 4) != 0 ? 3 : 0;
+	thread_opens_a_file(PARENT_TID, PARENT_FD);
+	if(child_event_first) {
+		child_is_created(CHILD_TID, PARENT_TID);
+		parent_clone_returns(CHILD_TID, PARENT_TID);
+	} else {
+		parent_clone_returns(CHILD_TID, PARENT_TID);
+		child_is_created(CHILD_TID, PARENT_TID);
+	}
+	thread_opens_a_file(PARENT_TID, PARENT_FD + 1);
+
+	std::vector<int> delay(2, 0);
+	delay[buffer_for_tgid(PARENT_TID)] = parent_delay;
+	delay[buffer_for_tgid(CHILD_TID)] = child_delay;
+	run_workers(delay);
+
+	const std::string what = std::string("child_event_first=") + (child_event_first ? "1" : "0") +
+	                         " parent_delay=" + std::to_string(parent_delay) +
+	                         " child_delay=" + std::to_string(child_delay);
+	EXPECT_TRUE(child_has_fd(PARENT_FD)) << what;
+	EXPECT_FALSE(child_has_fd(PARENT_FD + 1)) << what;
+	EXPECT_EQ(m_inspector.get_ctx_sync().get_stats().timeouts, 0u) << what;
+}
+
+// Same as above, with the clone exit of the caller: the late parent's worker takes the snapshot.
+TEST_P(multi_buffer_sync_repeat,
+       fd_opened_before_clone_is_inherited_when_the_parent_worker_is_late_with_the_caller_event) {
+	thread_opens_a_file(PARENT_TID, PARENT_FD);
+	parent_clone_returns(CHILD_TID, PARENT_TID);
+	child_is_created(CHILD_TID, PARENT_TID);
+
+	std::vector<int> delay(2, 0);
+	delay[buffer_for_tgid(PARENT_TID)] = 5;
+	run_workers(delay);
+
+	EXPECT_TRUE(child_has_fd(PARENT_FD));
+	EXPECT_EQ(m_inspector.get_ctx_sync().get_stats().timeouts, 0u);
 }
 
 // The child of a parent whose worker is late sees the new name of the parent (proc.pname).
@@ -340,6 +399,24 @@ TEST_F(single_thread_sync, no_waiting_in_single_thread_mode) {
 	EXPECT_NE(m_inspector.m_thread_manager->find_thread(CHILD_TID, true), nullptr);
 }
 
+// The fork snapshot handoff does not exist either: the caller creates the child, as before.
+TEST_F(single_thread_sync, no_snapshot_in_single_thread_mode) {
+	add_default_init_thread();
+	open_inspector();
+
+	sinsp_test_input::open_params params;
+	params.fd = PARENT_FD;
+	generate_open_x_event(params, PARENT_TID);
+	generate_clone_x_event(CHILD_TID, PARENT_TID, PARENT_TID, 0);  // the caller
+	auto child = m_inspector.m_thread_manager->find_thread(CHILD_TID, true);
+	ASSERT_NE(child, nullptr);
+	EXPECT_NE(child->get_fd(PARENT_FD), nullptr);
+	generate_clone_x_event(0, CHILD_TID, CHILD_TID, PARENT_TID);  // the child
+	const auto st = m_inspector.get_ctx_sync().get_handoff_stats();
+	EXPECT_EQ(st.put + st.consumed + st.live_copies + st.skipped_puts + st.dropped + st.pending,
+	          0u);
+}
+
 // --- micro benchmarks (disabled: run with --gtest_also_run_disabled_tests --gtest_filter=*bench*) --
 //
 // Synthetic numbers, not real traffic. They only print; nothing is asserted about time.
@@ -416,5 +493,112 @@ TEST_F(multi_buffer_sync, DISABLED_bench_wait_latency_parent_behind) {
 		       lag_us,
 		       sum_excess / N / 1000.0,
 		       max_excess / 1000.0);
+	}
+}
+
+namespace {
+// Bytes currently allocated from the heap (glibc), exact and not affected by the reuse of freed
+// memory, unlike the resident set size.
+size_t heap_in_use_bytes() {
+	const auto info = mallinfo2();
+	return info.uordblks + info.hblkhd;
+}
+}  // namespace
+
+// Cost of the fork snapshot handoff for a burst of forks (a cron burst): `CLONES` processes are
+// created by a parent that has `fds` open files. The caller events are processed in the buffer of
+// the parent (the cost is paid there), then the child events in the buffer of the children. With
+// the handoff off the caller event does nothing and the child copies the live parent.
+TEST_F(multi_buffer_sync, DISABLED_bench_clone_snapshot_cost) {
+	constexpr int CLONES = 1000;
+	for(const int fds : {0, 16, 64, 256}) {
+		for(int i = 0; i < fds; i++) {
+			thread_opens_a_file(PARENT_TID, 100 + i);
+		}
+		route_to_buffer(-1);
+		for(int i = 0; i < fds; i++) {
+			ASSERT_NE(next_event_from_buffer(buffer_for_tgid(PARENT_TID)), nullptr);
+		}
+		m_inspector.get_ctx_sync().publish_idle(buffer_for_tgid(PARENT_TID),
+		                                        UINT64_C(4000000000000000000));
+		double ns_caller[2] = {0, 0}, ns_child[2] = {0, 0};
+		for(const int on : {0, 1, 0, 1}) {  // interleaved, summed per mode
+			auto cfg = m_inspector.get_ctx_sync().get_config();
+			cfg.handoff_enabled = on != 0;
+			cfg.handoff_max_entries = 1000000;
+			cfg.handoff_ttl_ns = UINT64_C(1000000000000);
+			m_inspector.get_ctx_sync().set_config(cfg);
+			static int64_t next_tid = 100000;  // even: the child buffer is not the parent's
+			const int64_t first = next_tid;
+			for(int i = 0; i < CLONES; i++, next_tid += 2) {
+				parent_clone_returns(next_tid, PARENT_TID);
+				child_is_created(next_tid, PARENT_TID);
+			}
+			route_to_buffer(-1);
+			double t0 = now_ns();
+			for(int i = 0; i < CLONES; i++) {
+				ASSERT_NE(next_event_from_buffer(buffer_for_tgid(PARENT_TID)), nullptr);
+			}
+			ns_caller[on] += now_ns() - t0;
+			t0 = now_ns();
+			for(int i = 0; i < CLONES; i++) {
+				ASSERT_NE(next_event_from_buffer(buffer_for_tgid(first)), nullptr);
+			}
+			ns_child[on] += now_ns() - t0;
+		}
+		const double n = 2.0 * CLONES;
+		printf("BENCH fork, parent with %3d fds: caller event off %.0f on %.0f ns; child event "
+		       "off %.0f on %.0f ns; total off %.0f on %.0f ns/fork\n",
+		       fds,
+		       ns_caller[0] / n,
+		       ns_caller[1] / n,
+		       ns_child[0] / n,
+		       ns_child[1] / n,
+		       (ns_caller[0] + ns_child[0]) / n,
+		       (ns_caller[1] + ns_child[1]) / n);
+	}
+	const auto st = m_inspector.get_ctx_sync().get_handoff_stats();
+	printf("BENCH handoff stats: put=%lu consumed=%lu live=%lu skipped=%lu dropped=%lu "
+	       "pending=%lu\n",
+	       (unsigned long)st.put,
+	       (unsigned long)st.consumed,
+	       (unsigned long)st.live_copies,
+	       (unsigned long)st.skipped_puts,
+	       (unsigned long)st.dropped,
+	       (unsigned long)st.pending);
+}
+
+// Memory held by snapshots that were published and never consumed.
+TEST_F(multi_buffer_sync, DISABLED_bench_unconsumed_snapshot_memory) {
+	constexpr int SNAPSHOTS = 1000;
+	for(const int fds : {0, 16, 64, 256}) {
+		auto cfg = m_inspector.get_ctx_sync().get_config();
+		cfg.handoff_max_entries = 1000000;
+		cfg.handoff_ttl_ns = UINT64_C(1000000000000);
+		m_inspector.get_ctx_sync().set_config(cfg);
+		for(int i = 0; i < fds; i++) {
+			thread_opens_a_file(PARENT_TID, 100 + i);
+		}
+		static int64_t next_tid = 500000;
+		for(int i = 0; i < SNAPSHOTS; i++, next_tid += 2) {
+			parent_clone_returns(next_tid, PARENT_TID);
+		}
+		route_to_buffer(-1);
+		for(int i = 0; i < fds; i++) {
+			ASSERT_NE(next_event_from_buffer(buffer_for_tgid(PARENT_TID)), nullptr);
+		}
+		const size_t before = heap_in_use_bytes();
+		const auto pending_before = m_inspector.get_ctx_sync().handoff_pending();
+		for(int i = 0; i < SNAPSHOTS; i++) {
+			ASSERT_NE(next_event_from_buffer(buffer_for_tgid(PARENT_TID)), nullptr);
+		}
+		const size_t after = heap_in_use_bytes();
+		const auto held = m_inspector.get_ctx_sync().handoff_pending() - pending_before;
+		printf("BENCH snapshots held: parent with %3d fds: %lu snapshots, heap +%.1f KB total, "
+		       "%.0f bytes/snapshot\n",
+		       fds,
+		       (unsigned long)held,
+		       (after - before) / 1024.0,
+		       held ? static_cast<double>(after - before) / held : 0.0);
 	}
 }
