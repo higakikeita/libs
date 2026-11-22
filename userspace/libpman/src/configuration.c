@@ -214,12 +214,9 @@ int pman_init_state(falcosecurity_log_fn log_fn,
 		/* The following disables cpus-to-ring-buffers mapping */
 		g_state.cpus_for_each_buffer = 0;
 
-#ifdef BPF_ITERATOR_SUPPORT
-		/* BPF iterators configuration section */
-		if(init_iter_state((uint8_t)iters_num)) {
-			return -1;
-		}
-#endif /* BPF_ITERATOR_SUPPORT */
+		/* BPF iterators configuration section. When iterator support is not compiled in, this marks
+		 * the iterators as disabled. */
+		init_iter_state(disable_iterators, (uint8_t)iters_num);
 
 		return 0;
 	}
