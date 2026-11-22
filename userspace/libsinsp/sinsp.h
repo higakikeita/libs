@@ -239,7 +239,7 @@ public:
 	  \brief Cross-partition synchronization of the multi-worker mode (see sinsp_ctx_sync): used to
 	  configure the timeouts and to read the counters (waits, timeouts).
 	*/
-	sinsp_ctx_sync& get_ctx_sync() const { return *m_parser_shared_params->m_ctx_sync; }
+	sinsp_ctx_sync& get_ctx_sync() const { return *m_ctx_sync; }
 
 	/*!
 	  \brief Get the maximum number of bytes currently in use by any CPU buffer
@@ -1000,6 +1000,7 @@ private:
 	// A registry that manages the state tables of this inspector.
 	std::shared_ptr<libsinsp::state::table_registry> m_table_registry;
 	// Parameter shared with each single sinsp_parser instance.
+	std::shared_ptr<sinsp_ctx_sync> m_ctx_sync = std::make_shared<sinsp_ctx_sync>();
 	std::shared_ptr<sinsp_parser_shared_params> m_parser_shared_params;
 
 public:

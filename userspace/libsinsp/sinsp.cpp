@@ -261,7 +261,7 @@ sinsp::sinsp(bool with_metrics):
 	                                   m_observer,
 	                                   m_platform,
 	                                   false,
-	                                   std::make_shared<sinsp_ctx_sync>()});
+	                                   m_ctx_sync});
 
 	// m_next_reservable_buffer_handle is set to 1, as 0 is reserved for the default buffer.
 	m_next_reservable_buffer_handle = static_cast<sinsp_buffer_t>(1);

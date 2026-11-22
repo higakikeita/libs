@@ -177,7 +177,8 @@ protected:
 	// The buffer that the modern BPF probe uses for the events of a thread group: events are routed
 	// by TGID in the kernel, so tests that model real traffic pick the buffer with this.
 	uint16_t buffer_for_tgid(int64_t tgid) const {
-		return static_cast<uint16_t>(tgid % static_cast<int64_t>(m_buffer_events.size()));
+		return sinsp_ctx_sync::buffer_index_for_tgid(tgid,
+		                                             static_cast<uint16_t>(m_buffer_events.size()));
 	}
 
 	// Processes the next event of the given buffer. Returns nullptr if the buffer is empty.

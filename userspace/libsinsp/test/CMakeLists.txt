@@ -120,6 +120,7 @@ set(LIBSINSP_UNIT_TESTS_SOURCES
 	external_processor.ut.cpp
 	mpsc_priority_queue.ut.cpp
 	multi_buffer_order.ut.cpp
+	multi_buffer_sync.ut.cpp
 	token_bucket.ut.cpp
 	ppm_api_version.ut.cpp
 	plugins.ut.cpp

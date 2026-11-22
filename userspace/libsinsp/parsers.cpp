@@ -1050,14 +1050,17 @@ void sinsp_parser::wait_for_parent_partition(const sinsp_evt &evt, const int64_t
 	if(!m_params->m_multi_thread_mode || sync == nullptr || !sync->enabled()) {
 		return;
 	}
-	// If the parent is not in the table there is nothing we can copy, and no way to know the
-	// buffer it lives in: do not wait.
-	const auto parent = m_params->m_thread_manager->find_thread(ptid, true);
-	if(parent == nullptr) {
+	if(ptid <= 0) {
 		return;
 	}
-	const uint16_t target =
-	        sinsp_ctx_sync::buffer_index_for_tgid(parent->get_pid(), sync->n_buffers());
+	// The buffer of the parent is the one of its thread group. If the parent is not in the table
+	// yet, it is likely because the worker that creates it (its own clone exit) is behind: assume
+	// that the parent is the leader of its group (tgid == tid, which is the case for a fork from
+	// the main thread) and wait for that buffer, so the parent exists when it is looked up.
+	// Waiting on a wrong guess is harmless, it only costs a bounded wait.
+	const auto parent = m_params->m_thread_manager->find_thread(ptid, true);
+	const int64_t parent_tgid = parent != nullptr ? parent->get_pid() : ptid;
+	const uint16_t target = sinsp_ctx_sync::buffer_index_for_tgid(parent_tgid, sync->n_buffers());
 	m_params->m_ctx_sync->wait_for(m_buffer_idx, target, evt.get_ts());
 }
 
