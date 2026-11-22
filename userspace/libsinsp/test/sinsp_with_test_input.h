@@ -159,6 +159,27 @@ protected:
 	                               uint32_t n,
 	                               ...);
 
+	// va_list flavor of _add_event_to_buffer(), also used to route the events of the generate_*()
+	// helpers.
+	scap_evt* add_event_to_buffer_v(uint16_t buffer_idx,
+	                                uint64_t ts,
+	                                uint64_t tid,
+	                                ppm_event_code event_type,
+	                                const scap_empty_params_set* empty_params_set,
+	                                uint32_t n,
+	                                va_list args);
+
+	// From now on, the events created by the generate_*() helpers (clone, execve, open, ...) are not
+	// processed: they are queued in the given buffer and the helpers return nullptr. Pass -1 to go
+	// back to the normal behavior. Requires open_inspector_multi_buffer().
+	void route_to_buffer(int buffer_idx) { m_route_buffer = buffer_idx; }
+
+	// The buffer that the modern BPF probe uses for the events of a thread group: events are routed
+	// by TGID in the kernel, so tests that model real traffic pick the buffer with this.
+	uint16_t buffer_for_tgid(int64_t tgid) const {
+		return static_cast<uint16_t>(tgid % static_cast<int64_t>(m_buffer_events.size()));
+	}
+
 	// Processes the next event of the given buffer. Returns nullptr if the buffer is empty.
 	sinsp_evt* next_event_from_buffer(uint16_t buffer_idx);
 
@@ -503,6 +524,7 @@ protected:
 	std::vector<scap_test_input_buffer> m_test_buffers;
 	std::vector<std::vector<scap_evt*>> m_buffer_events;
 	std::vector<uint64_t> m_buffer_last_ts;
+	int m_route_buffer = -1;
 	std::vector<scap_evt*> m_async_events;
 
 	std::vector<scap_threadinfo> m_threads;

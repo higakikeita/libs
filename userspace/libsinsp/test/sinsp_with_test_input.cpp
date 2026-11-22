@@ -64,6 +64,21 @@ scap_evt* sinsp_with_test_input::_add_event_to_buffer(uint16_t buffer_idx,
                                                       ppm_event_code event_type,
                                                       uint32_t n,
                                                       ...) {
+	va_list args;
+	va_start(args, n);
+	scap_evt* event = add_event_to_buffer_v(buffer_idx, ts, tid, event_type, nullptr, n, args);
+	va_end(args);
+	return event;
+}
+
+scap_evt* sinsp_with_test_input::add_event_to_buffer_v(
+        uint16_t buffer_idx,
+        uint64_t ts,
+        uint64_t tid,
+        ppm_event_code event_type,
+        const scap_empty_params_set* empty_params_set,
+        uint32_t n,
+        va_list args) {
 	if(buffer_idx >= m_buffer_events.size()) {
 		throw std::runtime_error("buffer " + std::to_string(buffer_idx) +
 		                         " does not exist: call open_inspector_multi_buffer() first");
@@ -72,10 +87,7 @@ scap_evt* sinsp_with_test_input::_add_event_to_buffer(uint16_t buffer_idx,
 		throw std::runtime_error("events of the same buffer cannot have decreasing timestamps");
 	}
 
-	va_list args;
-	va_start(args, n);
-	scap_evt* event = create_event_v(ts, tid, event_type, nullptr, n, args);
-	va_end(args);
+	scap_evt* event = create_event_v(ts, tid, event_type, empty_params_set, n, args);
 	if(event == nullptr) {
 		throw std::runtime_error("cannot create event type: " + std::to_string(event_type));
 	}
@@ -175,6 +187,18 @@ void sinsp_with_test_input::add_filtered_event_advance_ts_v(
         const scap_empty_params_set* empty_params_set,
         uint32_t n,
         va_list args) {
+	if(m_route_buffer >= 0) {
+		// Multi-buffer mode: the event is queued in the buffer chosen with route_to_buffer() and not
+		// processed. The caller decides when, with next_event_from_buffer().
+		add_event_to_buffer_v(static_cast<uint16_t>(m_route_buffer),
+		                      ts,
+		                      tid,
+		                      event_type,
+		                      empty_params_set,
+		                      n,
+		                      args);
+		return;
+	}
 	add_event_v(ts, tid, event_type, empty_params_set, n, args);
 	sinsp_evt* evt = advance_ts_get_event(ts);
 	if(evt != nullptr) {
@@ -207,6 +231,18 @@ sinsp_evt* sinsp_with_test_input::add_event_advance_ts_v(
         const scap_empty_params_set* empty_params_set,
         uint32_t n,
         va_list args) {
+	if(m_route_buffer >= 0) {
+		// Multi-buffer mode: the event is queued in the buffer chosen with route_to_buffer() and not
+		// processed. The caller decides when, with next_event_from_buffer().
+		add_event_to_buffer_v(static_cast<uint16_t>(m_route_buffer),
+		                      ts,
+		                      tid,
+		                      event_type,
+		                      empty_params_set,
+		                      n,
+		                      args);
+		return nullptr;
+	}
 	add_event_v(ts, tid, event_type, empty_params_set, n, args);
 	sinsp_evt* evt = advance_ts_get_event(ts);
 	if(evt != nullptr) {
