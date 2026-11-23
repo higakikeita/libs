@@ -119,6 +119,7 @@ set(LIBSINSP_UNIT_TESTS_SOURCES
 	events_user.ut.cpp
 	external_processor.ut.cpp
 	mpsc_priority_queue.ut.cpp
+	multi_buffer_defects.ut.cpp
 	multi_buffer_order.ut.cpp
 	multi_buffer_sync.ut.cpp
 	token_bucket.ut.cpp
